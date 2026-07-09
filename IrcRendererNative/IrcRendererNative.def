@@ -1,0 +1,18 @@
+LIBRARY IrcRendererNative
+EXPORTS
+    CreateRenderer
+    DestroyRenderer
+    GetChildHwnd
+    AddLine
+    RenderFrame
+    SetSize
+    ScrollByPixels
+    ScrollToOffset
+    ScrollToEnd
+    Clear
+    GetLineCount
+    GetChatScrollInfo
+    SelectionBegin
+    SelectionUpdate
+    SelectionGetText
+    SelectionEnd

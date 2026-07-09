@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <Platforms>AnyCPU;x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <!-- Managed allocation is minimal (lines are stackalloc-encoded straight
+         into the native queue), so background GC buys nothing; ICU is skipped
+         because no culture-aware collation/casing is used. Revisit
+         InvariantGlobalization if this grows into a full client. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NativeDllPath>$(MSBuildThisFileDirectory)..\build\$(Configuration)\IrcRendererNative.dll</NativeDllPath>
+  </PropertyGroup>
+
+  <!-- Tracked item so Visual Studio's fast up-to-date check re-copies a rebuilt
+       native DLL even when no C# changed. -->
+  <ItemGroup Condition="Exists('$(NativeDllPath)')">
+    <None Include="$(NativeDllPath)" Link="IrcRendererNative.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <Target Name="CopyNativeDll" AfterTargets="Build">
+    <!-- Copy the native renderer DLL next to the managed executable if it exists. -->
+    <Copy SourceFiles="$(NativeDllPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(NativeDllPath)')" />
+  </Target>
+
+</Project>

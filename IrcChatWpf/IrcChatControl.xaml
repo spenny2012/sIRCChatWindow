@@ -1,0 +1,29 @@
+<UserControl x:Class="IrcChatWpf.IrcChatControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Focusable="True"
+             UseLayoutRounding="True"
+             Background="Black">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Child receives the native swapchain HWND host (set in code-behind);
+             the child window is hit-test transparent so mouse events reach WPF. -->
+        <Border x:Name="ImageHost"
+                Grid.Column="0"
+                BorderBrush="Gray"
+                BorderThickness="1"
+                Background="#101010"
+                ClipToBounds="True"
+                SizeChanged="OnSizeChanged" />
+
+        <ScrollBar x:Name="ChatScrollBar"
+                   Grid.Column="1"
+                   Orientation="Vertical"
+                   Minimum="0"
+                   Scroll="OnScroll" />
+    </Grid>
+</UserControl>
