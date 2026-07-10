@@ -3,7 +3,7 @@
 
 namespace
 {
-    // Records start 4-aligned so the Segment array (alignof 2) inside each
+    // Records start 4-aligned so the Segment array (alignof 4) inside each
     // record is always safely addressable.
     inline uint32_t AlignUp(uint32_t v) noexcept
     {

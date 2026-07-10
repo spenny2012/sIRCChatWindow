@@ -5,7 +5,6 @@
 #include "MpscQueue.h"
 
 constexpr uint32_t InputQueueCapacity = 4096;
-constexpr uint32_t MaxPaletteColors = 16;
 
 struct FrameResult
 {
@@ -67,7 +66,6 @@ private:
     void ProcessInputQueue();
     void UpdateLineHeight();
     void EnsureBrushes();
-    void FillPalette();
 
     // Word-wrap layout is pure column arithmetic (monospace font, byte-per-char).
     void GetColumns(int& cols, int& contCols) const;
@@ -85,7 +83,7 @@ private:
         uint64_t& endLine, uint16_t& endOffset) const;
 
     void DrawSegment(const char* text, uint16_t length, float x, float y,
-        float segWidth, uint8_t fg, uint8_t bg, uint8_t flags);
+        float segWidth, uint32_t fg, uint32_t bg, uint8_t flags);
     float MeasureSegment(const char* text, uint16_t length, uint8_t flags);
 
     IDWriteTextFormat* GetTextFormat(uint8_t flags) const;
@@ -102,10 +100,11 @@ private:
     // D2D
     ID2D1Factory*           m_d2dFactory = nullptr;
     ID2D1RenderTarget*      m_renderTarget = nullptr;
-    ID2D1SolidColorBrush*   m_brushes[MaxPaletteColors] = {};
     ID2D1SolidColorBrush*   m_defaultFgBrush = nullptr;
     ID2D1SolidColorBrush*   m_defaultBgBrush = nullptr;
     ID2D1SolidColorBrush*   m_selectionBrush = nullptr;
+    // Recolored per segment via SetColor; D2D snapshots brush state per call.
+    ID2D1SolidColorBrush*   m_scratchBrush = nullptr;
 
     // DWrite
     IDWriteFactory*         m_dwriteFactory = nullptr;
@@ -125,6 +124,8 @@ private:
     float                   m_lineHeight = 16.0f;
     float                   m_fontSize = 14.0f;
     float                   m_charWidthDips = 8.0f;   // monospace advance width
+    float                   m_underlineY = 15.4f;     // underline top, relative to row top
+    float                   m_underlineThickness = 1.0f;
     uint32_t                m_totalRows = 0;          // wrapped rows across all slots
     double                  m_scrollOffsetDips = 0.0; // distance from bottom of content; 0 = pinned
     bool                    m_autoScroll = true;
@@ -139,7 +140,6 @@ private:
     uint64_t                m_selCaretLine = 0;
     uint16_t                m_selCaretOffset = 0;
     bool                    m_selWasAutoScroll = false; // pin state to restore on end
-    uint32_t                m_palette[MaxPaletteColors] = {};
 
     // Batching
     uint64_t                m_lastInputTime = 0;

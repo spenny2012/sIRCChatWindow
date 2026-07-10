@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Renderer.h"
 #include "IrcParser.h"
+#include "Palette.h"
 
 #include <cmath>
 
@@ -13,24 +14,15 @@ namespace
     // costing well under a millisecond (ingest is parse + wrap arithmetic only).
     constexpr int   MaxInputBatch = 1024;
 
-    const D2D1_COLOR_F g_mircColors[MaxPaletteColors] = {
-        { 1.00f, 1.00f, 1.00f, 1.0f }, // 0 white
-        { 0.00f, 0.00f, 0.00f, 1.0f }, // 1 black
-        { 0.00f, 0.00f, 0.50f, 1.0f }, // 2 navy
-        { 0.00f, 0.50f, 0.00f, 1.0f }, // 3 green
-        { 1.00f, 0.00f, 0.00f, 1.0f }, // 4 red
-        { 0.50f, 0.00f, 0.00f, 1.0f }, // 5 maroon
-        { 0.50f, 0.00f, 0.50f, 1.0f }, // 6 purple
-        { 1.00f, 0.50f, 0.00f, 1.0f }, // 7 orange
-        { 1.00f, 1.00f, 0.00f, 1.0f }, // 8 yellow
-        { 0.00f, 1.00f, 0.00f, 1.0f }, // 9 lime
-        { 0.00f, 0.50f, 0.50f, 1.0f }, // 10 teal
-        { 0.00f, 1.00f, 1.00f, 1.0f }, // 11 cyan
-        { 0.00f, 0.00f, 1.00f, 1.0f }, // 12 blue
-        { 1.00f, 0.00f, 1.00f, 1.0f }, // 13 pink
-        { 0.50f, 0.50f, 0.50f, 1.0f }, // 14 grey
-        { 0.75f, 0.75f, 0.75f, 1.0f }  // 15 light grey
-    };
+    inline D2D1_COLOR_F ColorFromU32(uint32_t c)
+    {
+        return D2D1_COLOR_F{
+            static_cast<float>((c >> 16) & 0xFF) / 255.0f,
+            static_cast<float>((c >> 8) & 0xFF) / 255.0f,
+            static_cast<float>(c & 0xFF) / 255.0f,
+            static_cast<float>((c >> 24) & 0xFF) / 255.0f
+        };
+    }
 
     inline D2D1_RECT_F Rect(float x, float y, float w, float h)
     {
@@ -133,26 +125,11 @@ namespace
     }
 }
 
-Renderer::Renderer()
-{
-    FillPalette();
-}
+Renderer::Renderer() = default;
 
 Renderer::~Renderer()
 {
     Shutdown();
-}
-
-void Renderer::FillPalette()
-{
-    for (uint32_t i = 0; i < MaxPaletteColors; ++i)
-    {
-        const D2D1_COLOR_F& c = g_mircColors[i];
-        m_palette[i] = (static_cast<uint32_t>(c.a * 255) << 24) |
-                       (static_cast<uint32_t>(c.r * 255) << 16) |
-                       (static_cast<uint32_t>(c.g * 255) <<  8) |
-                       (static_cast<uint32_t>(c.b * 255));
-    }
 }
 
 bool Renderer::Initialize(HWND parent, int width, int height, float dpiScale)
@@ -195,10 +172,7 @@ void Renderer::Shutdown()
 // to be released before ResizeBuffers (brushes are bound to the target).
 void Renderer::ReleaseBackBufferResources()
 {
-    for (auto& b : m_brushes)
-    {
-        SafeRelease(b);
-    }
+    SafeRelease(m_scratchBrush);
     SafeRelease(m_defaultFgBrush);
     SafeRelease(m_defaultBgBrush);
     SafeRelease(m_selectionBrush);
@@ -400,6 +374,8 @@ bool Renderer::CreateDWriteResources()
 void Renderer::UpdateLineHeight()
 {
     m_lineHeight = FontSize * LineHeightRatio;
+    m_underlineY = FontSize * 1.1f;
+    m_underlineThickness = 1.0f;
     if (m_fontFace)
     {
         DWRITE_FONT_METRICS metrics = {};
@@ -408,8 +384,12 @@ void Renderer::UpdateLineHeight()
         {
             const float ratio = FontSize / static_cast<float>(metrics.designUnitsPerEm);
             m_lineHeight = (metrics.ascent + metrics.descent + metrics.lineGap) * ratio;
+            // underlinePosition is negative (below baseline).
+            m_underlineY = (metrics.ascent - metrics.underlinePosition) * ratio;
+            m_underlineThickness = std::max(metrics.underlineThickness * ratio, 1.0f);
         }
     }
+    m_underlineY = std::min(m_underlineY, m_lineHeight - m_underlineThickness);
 }
 
 void Renderer::EnsureBrushes()
@@ -433,11 +413,10 @@ void Renderer::EnsureBrushes()
         D2D1_COLOR_F selColor = { 0.35f, 0.55f, 0.95f, 0.35f };
         m_renderTarget->CreateSolidColorBrush(&selColor, nullptr, &m_selectionBrush);
     }
-
-    for (uint32_t i = 0; i < MaxPaletteColors; ++i)
+    if (!m_scratchBrush)
     {
-        if (!m_brushes[i])
-            m_renderTarget->CreateSolidColorBrush(&g_mircColors[i], nullptr, &m_brushes[i]);
+        D2D1_COLOR_F initial = { 1.0f, 1.0f, 1.0f, 1.0f };
+        m_renderTarget->CreateSolidColorBrush(&initial, nullptr, &m_scratchBrush);
     }
 }
 
@@ -476,7 +455,7 @@ float Renderer::MeasureSegment(const char* text, uint16_t length, uint8_t flags)
 }
 
 void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
-    float segWidth, uint8_t fg, uint8_t bg, uint8_t flags)
+    float segWidth, uint32_t fg, uint32_t bg, uint8_t flags)
 {
     if (!m_renderTarget || length == 0)
         return;
@@ -485,15 +464,22 @@ void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
     if (!format)
         return;
 
-    if (bg != IrcParser::ColorDefault && bg < MaxPaletteColors)
+    // Alpha 0 is the "default" sentinel from the parser: no bg fill, default
+    // fg brush. Anything else is an exact color via the scratch brush (D2D
+    // snapshots brush state per draw call, so SetColor per segment is safe).
+    if (bg & 0xFF000000u)
     {
+        m_scratchBrush->SetColor(ColorFromU32(bg));
         D2D1_RECT_F bgRect = Rect(x, y, segWidth, m_lineHeight);
-        m_renderTarget->FillRectangle(&bgRect, m_brushes[bg]);
+        m_renderTarget->FillRectangle(&bgRect, m_scratchBrush);
     }
 
     ID2D1SolidColorBrush* brush = m_defaultFgBrush;
-    if (fg != IrcParser::ColorDefault && fg < MaxPaletteColors)
-        brush = m_brushes[fg];
+    if (fg & 0xFF000000u)
+    {
+        m_scratchBrush->SetColor(ColorFromU32(fg));
+        brush = m_scratchBrush;
+    }
 
     wchar_t buffer[IrcLineTextSize] = {};
     for (uint16_t i = 0; i < length; ++i)
@@ -502,6 +488,12 @@ void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
     D2D1_RECT_F layoutRect = Rect(x, y, m_viewWidthDips - x, m_lineHeight);
     m_renderTarget->DrawText(buffer, length, format, &layoutRect, brush,
         D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+    if (flags & 0x04)
+    {
+        D2D1_RECT_F ul = Rect(x, y + m_underlineY, segWidth, m_underlineThickness);
+        m_renderTarget->FillRectangle(&ul, brush);
+    }
 }
 
 bool Renderer::AddLine(const char* text, int length)
@@ -655,7 +647,7 @@ FrameResult Renderer::RenderFrame()
             {
                 // No segments parsed: draw as plain text (no bg fill, width unused)
                 DrawSegment(slot.text + rowStart, rowEnd - rowStart, x, y, 0.0f,
-                    IrcParser::ColorDefault, IrcParser::ColorDefault, 0);
+                    IrcPalette::Default, IrcPalette::Default, 0);
             }
             else
             {

@@ -5,9 +5,9 @@
 
 namespace IrcParser
 {
-    constexpr uint8_t ColorDefault = 99;
-
-    // Parse raw IRC text (with mIRC control codes) directly into a LineSlot.
+    // Parse raw IRC text (mIRC control codes and ANSI escape sequences)
+    // directly into a LineSlot. Control bytes are stripped from the stored
+    // text; formatting is resolved to packed colors in the segments.
     // No allocations, no exceptions.
     void Parse(LineSlot* slot, const char* text, uint16_t length) noexcept;
 }

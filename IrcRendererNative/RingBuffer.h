@@ -7,17 +7,20 @@ constexpr uint32_t IrcLineTextSize = 512;
 constexpr uint32_t IrcMaxSegments = 16;
 
 // Byte budget for packed line storage. Typical traffic (~200 B/line) hits the
-// 50k line cap well under this; worst-case max-length lines retain ~27k lines
+// 50k line cap well under this; worst-case max-length lines retain ~24k lines
 // before the byte budget evicts.
 constexpr uint32_t IrcArenaBytes = 16 * 1024 * 1024;
 
 struct Segment
 {
+    uint32_t fg;       // 0xAARRGGBB resolved color; 0 = default (renderer fg brush)
+    uint32_t bg;       // 0xAARRGGBB resolved color; 0 = default (no bg fill)
     uint16_t offset;   // byte offset into the line text where this segment starts
-    uint8_t  fg;       // mIRC foreground color (0-15, 99 = default)
-    uint8_t  bg;       // mIRC background color (0-15, 99 = default)
     uint8_t  flags;    // bit 0 = bold, bit 1 = italic, bit 2 = underline
+    uint8_t  reserved; // zero; keeps arena record bytes deterministic
 };
+
+static_assert(sizeof(Segment) == 12, "Segment layout is the arena record format");
 
 // Ingest scratch: IrcParser::Parse fills one of these on the stack, then
 // RingBuffer::Append packs the used portion into the arena. Never stored.
@@ -31,7 +34,7 @@ struct LineSlot
     uint8_t  segmentCount;
 };
 
-static_assert(sizeof(LineSlot) <= 640, "LineSlot should stay compact");
+static_assert(sizeof(LineSlot) <= 720, "LineSlot should stay compact");
 
 // Read-only view of a stored line. Pointers reference the arena and stay valid
 // only until the next Append/Clear (single-threaded: render thread only).
