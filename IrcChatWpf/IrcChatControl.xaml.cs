@@ -13,6 +13,8 @@ namespace IrcChatWpf
         private IrcSwapchainHost _ircHost;
         private bool _updatingScroll;
         private bool _selecting;
+        private Color? _fgColor; // set before the host exists → applied on creation
+        private Color? _bgColor;
         private readonly DispatcherTimer _dragScrollTimer;
 
         public IrcChatControl()
@@ -62,6 +64,30 @@ namespace IrcChatWpf
 
         public int LineCount => _ircHost?.LineCount ?? 0;
 
+        /// <summary>Sets the chat surface's background color. Applies
+        /// immediately to all content (explicit mIRC/ANSI colors are
+        /// unaffected). Safe to call before the control is loaded.</summary>
+        public void SetBackgroundColor(Color color)
+        {
+            _bgColor = color;
+            ImageHost.Background = new SolidColorBrush(color);
+            _ircHost?.SetBackgroundColor(PackArgb(color));
+        }
+
+        /// <summary>Sets the default text color (text without explicit
+        /// mIRC/ANSI colors). Applies immediately to all content. Safe to
+        /// call before the control is loaded.</summary>
+        public void SetForegroundColor(Color color)
+        {
+            _fgColor = color;
+            _ircHost?.SetForegroundColor(PackArgb(color));
+        }
+
+        // Opaque: the swapchain has no per-pixel alpha, so a translucent
+        // default would silently misrender.
+        private static uint PackArgb(Color c) =>
+            0xFF000000u | (uint)c.R << 16 | (uint)c.G << 8 | c.B;
+
         private void OnSizeChanged(object sender, SizeChangedEventArgs e)
         {
             // Swapchain ResizeBuffers reuses the buffer allocations; cheap
@@ -94,6 +120,8 @@ namespace IrcChatWpf
             if (_ircHost == null)
             {
                 _ircHost = new IrcSwapchainHost(px, py, dpi.DpiScaleX);
+                if (_bgColor is Color bg) _ircHost.SetBackgroundColor(PackArgb(bg));
+                if (_fgColor is Color fg) _ircHost.SetForegroundColor(PackArgb(fg));
                 _ircHost.FrameRendered += OnFrameRendered;
                 ImageHost.Child = _ircHost;
             }

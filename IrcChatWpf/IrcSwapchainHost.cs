@@ -18,6 +18,9 @@ namespace IrcChatWpf
         private int _width;
         private int _height;
         private double _dpiScale;
+        // Defaults mirror the native renderer's initial theme (IrcPalette).
+        private uint _fgArgb = 0xFFF2F2F2;
+        private uint _bgArgb = 0xFF141414;
 
         public IrcSwapchainHost(int pixelWidth, int pixelHeight, double dpiScale)
         {
@@ -34,6 +37,10 @@ namespace IrcChatWpf
             _renderer = NativeMethods.CreateRenderer(hwndParent.Handle, _width, _height, (float)_dpiScale);
             if (_renderer == IntPtr.Zero)
                 throw new InvalidOperationException("Failed to create native IRC renderer.");
+
+            // Colors may have been set before the native renderer existed.
+            NativeMethods.SetBackgroundColor(_renderer, _bgArgb);
+            NativeMethods.SetForegroundColor(_renderer, _fgArgb);
 
             _timer = new DispatcherTimer(DispatcherPriority.Render)
             {
@@ -84,6 +91,20 @@ namespace IrcChatWpf
         public void ScrollToOffset(double offsetDips) { if (_renderer != IntPtr.Zero) NativeMethods.ScrollToOffset(_renderer, (float)offsetDips); }
         public void ScrollToEnd() { if (_renderer != IntPtr.Zero) NativeMethods.ScrollToEnd(_renderer); }
         public void Clear() { if (_renderer != IntPtr.Zero) NativeMethods.Clear(_renderer); }
+
+        public void SetBackgroundColor(uint argb)
+        {
+            _bgArgb = argb;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetBackgroundColor(_renderer, argb);
+        }
+
+        public void SetForegroundColor(uint argb)
+        {
+            _fgArgb = argb;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetForegroundColor(_renderer, argb);
+        }
         public int LineCount => _renderer != IntPtr.Zero ? NativeMethods.GetLineCount(_renderer) : 0;
 
         public void SelectionBegin(double xDips, double yDips) { if (_renderer != IntPtr.Zero) NativeMethods.SelectionBegin(_renderer, (float)xDips, (float)yDips); }

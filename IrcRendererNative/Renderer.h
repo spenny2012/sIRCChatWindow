@@ -3,6 +3,7 @@
 #include "pch.h"
 #include "RingBuffer.h"
 #include "MpscQueue.h"
+#include "Palette.h"
 
 constexpr uint32_t InputQueueCapacity = 4096;
 
@@ -37,6 +38,12 @@ public:
     void ScrollToOffset(float offsetDips);
     void ScrollToEnd();
     void Clear();
+
+    // Default (theme) colors, 0xAARRGGBB; alpha is forced opaque. Applied at
+    // draw time, so existing default-colored content recolors immediately.
+    // UI-thread only, like SetSize/Clear.
+    void SetBackgroundColor(uint32_t argb);
+    void SetForegroundColor(uint32_t argb);
 
     // Selection: coordinates are viewport-relative DIPs. Begin freezes
     // auto-scroll for the duration of the drag; End clears the selection and
@@ -101,7 +108,6 @@ private:
     ID2D1Factory*           m_d2dFactory = nullptr;
     ID2D1RenderTarget*      m_renderTarget = nullptr;
     ID2D1SolidColorBrush*   m_defaultFgBrush = nullptr;
-    ID2D1SolidColorBrush*   m_defaultBgBrush = nullptr;
     ID2D1SolidColorBrush*   m_selectionBrush = nullptr;
     // Recolored per segment via SetColor; D2D snapshots brush state per call.
     ID2D1SolidColorBrush*   m_scratchBrush = nullptr;
@@ -123,6 +129,8 @@ private:
     float                   m_viewHeightDips = 0.0f;
     float                   m_lineHeight = 16.0f;
     float                   m_fontSize = 14.0f;
+    uint32_t                m_fgColor = IrcPalette::DefaultFg; // default text color
+    uint32_t                m_bgColor = IrcPalette::DefaultBg; // clear color
     float                   m_charWidthDips = 8.0f;   // monospace advance width
     float                   m_underlineY = 15.4f;     // underline top, relative to row top
     float                   m_underlineThickness = 1.0f;
@@ -155,6 +163,8 @@ extern "C" __declspec(dllexport) void ScrollByPixels(Renderer* renderer, float d
 extern "C" __declspec(dllexport) void ScrollToOffset(Renderer* renderer, float offsetDips);
 extern "C" __declspec(dllexport) void ScrollToEnd(Renderer* renderer);
 extern "C" __declspec(dllexport) void Clear(Renderer* renderer);
+extern "C" __declspec(dllexport) void SetBackgroundColor(Renderer* renderer, uint32_t argb);
+extern "C" __declspec(dllexport) void SetForegroundColor(Renderer* renderer, uint32_t argb);
 extern "C" __declspec(dllexport) int GetLineCount(Renderer* renderer);
 // "Chat" prefix avoids an extern "C" clash with the Win32 GetScrollInfo in winuser.h.
 extern "C" __declspec(dllexport) void GetChatScrollInfo(Renderer* renderer, float* contentHeight,

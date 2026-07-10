@@ -10,6 +10,8 @@ EXPORTS
     ScrollToOffset
     ScrollToEnd
     Clear
+    SetBackgroundColor
+    SetForegroundColor
     GetLineCount
     GetChatScrollInfo
     SelectionBegin

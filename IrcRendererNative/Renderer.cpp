@@ -174,7 +174,6 @@ void Renderer::ReleaseBackBufferResources()
 {
     SafeRelease(m_scratchBrush);
     SafeRelease(m_defaultFgBrush);
-    SafeRelease(m_defaultBgBrush);
     SafeRelease(m_selectionBrush);
     SafeRelease(m_renderTarget);
     SafeRelease(m_surface);
@@ -397,14 +396,9 @@ void Renderer::EnsureBrushes()
     if (!m_renderTarget)
         return;
 
-    if (!m_defaultBgBrush)
-    {
-        D2D1_COLOR_F bgColor = { 0.08f, 0.08f, 0.08f, 1.0f };
-        m_renderTarget->CreateSolidColorBrush(&bgColor, nullptr, &m_defaultBgBrush);
-    }
     if (!m_defaultFgBrush)
     {
-        D2D1_COLOR_F fgColor = { 0.95f, 0.95f, 0.95f, 1.0f };
+        D2D1_COLOR_F fgColor = ColorFromU32(m_fgColor);
         m_renderTarget->CreateSolidColorBrush(&fgColor, nullptr, &m_defaultFgBrush);
     }
     if (!m_selectionBrush)
@@ -547,7 +541,7 @@ void Renderer::ProcessInputQueue()
     {
         scratch.length = 0;
         scratch.segmentCount = 0; // Parse appends from these; text needs no reset
-        IrcParser::Parse(&scratch, buffer, length);
+        IrcParser::Parse(&scratch, buffer, length, m_fgColor, m_bgColor);
         scratch.rowCount = ComputeWrapRows(scratch.text, scratch.length, cols, contCols,
             nullptr, IrcLineTextSize);
         m_totalRows -= m_ringBuffer.Append(scratch); // rows of any evicted lines
@@ -590,7 +584,7 @@ FrameResult Renderer::RenderFrame()
     EnsureBrushes();
 
     m_renderTarget->BeginDraw();
-    D2D1_COLOR_F clearColor = { 0.08f, 0.08f, 0.08f, 1.0f };
+    D2D1_COLOR_F clearColor = ColorFromU32(m_bgColor);
     m_renderTarget->Clear(&clearColor);
 
     const uint32_t count = m_ringBuffer.Count();
@@ -1029,6 +1023,20 @@ void Renderer::Clear()
     m_dirty = true;
 }
 
+void Renderer::SetBackgroundColor(uint32_t argb)
+{
+    m_bgColor = argb | 0xFF000000u; // opaque swapchain: force alpha
+    m_dirty = true;
+}
+
+void Renderer::SetForegroundColor(uint32_t argb)
+{
+    m_fgColor = argb | 0xFF000000u;
+    if (m_defaultFgBrush)
+        m_defaultFgBrush->SetColor(ColorFromU32(m_fgColor));
+    m_dirty = true;
+}
+
 void Renderer::GetScrollInfo(float* contentHeight, float* viewportHeight,
     float* scrollOffset, float* lineHeight, int* pinned) const
 {
@@ -1097,6 +1105,16 @@ extern "C" __declspec(dllexport) void ScrollToOffset(Renderer* renderer, float o
 extern "C" __declspec(dllexport) void ScrollToEnd(Renderer* renderer)
 {
     if (renderer) renderer->ScrollToEnd();
+}
+
+extern "C" __declspec(dllexport) void SetBackgroundColor(Renderer* renderer, uint32_t argb)
+{
+    if (renderer) renderer->SetBackgroundColor(argb);
+}
+
+extern "C" __declspec(dllexport) void SetForegroundColor(Renderer* renderer, uint32_t argb)
+{
+    if (renderer) renderer->SetForegroundColor(argb);
 }
 
 extern "C" __declspec(dllexport) void Clear(Renderer* renderer)

@@ -42,6 +42,12 @@ namespace IrcChatWpf
         public static extern void Clear(IntPtr renderer);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SetBackgroundColor(IntPtr renderer, uint argb);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SetForegroundColor(IntPtr renderer, uint argb);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int GetLineCount(IntPtr renderer);
 
         [DllImport(DllName, EntryPoint = "GetChatScrollInfo", CallingConvention = CallingConvention.Cdecl)]

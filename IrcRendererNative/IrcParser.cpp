@@ -38,20 +38,22 @@ namespace
     }
 
     inline void FlushSegment(LineSlot* slot, uint16_t start, uint16_t end,
-        const Style& st) noexcept
+        const Style& st, uint32_t defaultFg, uint32_t defaultBg) noexcept
     {
         if (end <= start || slot->segmentCount >= IrcMaxSegments)
             return;
 
         // Reverse video swaps effective colors at emission, substituting the
         // concrete default colors so "default reversed" still swaps visibly.
-        // Base state stays untouched, so SGR 27 restores it exactly.
+        // Base state stays untouched, so SGR 27 restores it exactly. The
+        // defaults are the theme at parse time; a later theme change does not
+        // rewrite already-parsed reversed spans.
         uint32_t fg = st.fg;
         uint32_t bg = st.bg;
         if (st.reverse)
         {
-            fg = st.bg ? st.bg : IrcPalette::DefaultBg;
-            bg = st.fg ? st.fg : IrcPalette::DefaultFg;
+            fg = st.bg ? st.bg : defaultBg;
+            bg = st.fg ? st.fg : defaultFg;
         }
 
         Segment& seg = slot->segments[slot->segmentCount++];
@@ -224,7 +226,8 @@ namespace
     }
 }
 
-void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcept
+void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
+    uint32_t defaultFg, uint32_t defaultBg) noexcept
 {
     Style st;
     uint16_t segmentStart = 0;
@@ -235,7 +238,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         const char c = text[i];
         if (c == '\x02')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             st.flags ^= 0x01; // toggle bold
             segmentStart = slot->length;
             ++i;
@@ -243,7 +246,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         }
         if (c == '\x16')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             st.flags ^= 0x02; // toggle italic
             segmentStart = slot->length;
             ++i;
@@ -251,7 +254,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         }
         if (c == '\x1F')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             st.flags ^= 0x04; // toggle underline
             segmentStart = slot->length;
             ++i;
@@ -259,7 +262,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         }
         if (c == '\x0F')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             st = Style{};
             segmentStart = slot->length;
             ++i;
@@ -267,7 +270,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         }
         if (c == '\x03')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             ++i;
             const uint8_t newFg = ParseColor(text, i, length);
             uint8_t newBg = MircIndexDefault;
@@ -287,7 +290,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         }
         if (c == '\x1B')
         {
-            FlushSegment(slot, segmentStart, slot->length, st);
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             ConsumeEscape(text, i, length, st);
             segmentStart = slot->length;
             continue;
@@ -300,5 +303,5 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length) noexcep
         ++i;
     }
 
-    FlushSegment(slot, segmentStart, slot->length, st);
+    FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
 }

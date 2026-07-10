@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Windows;
+using System.Windows.Media;
 
 namespace IrcChatWpf
 {
@@ -155,6 +156,26 @@ namespace IrcChatWpf
             ChatControl.AddLine($"inline: A{Esc}[999mB {Esc}[38;5mC {Esc}[2JD {Esc}]0;osc-titleE");
             ChatControl.AddLine($"truncated CSI at EOL (line should end at the colon): {Esc}[12;");
             ChatControl.AddLine($"bare ESC at EOL: ok{Esc}");
+        }
+
+        private bool _lightTheme;
+
+        private void OnThemeClick(object sender, RoutedEventArgs e)
+        {
+            _lightTheme = !_lightTheme;
+            if (_lightTheme)
+            {
+                ChatControl.SetBackgroundColor(Color.FromRgb(0xFA, 0xFA, 0xFA));
+                ChatControl.SetForegroundColor(Color.FromRgb(0x1A, 0x1A, 0x1A));
+            }
+            else
+            {
+                ChatControl.SetBackgroundColor(Color.FromRgb(0x14, 0x14, 0x14));
+                ChatControl.SetForegroundColor(Color.FromRgb(0xF2, 0xF2, 0xF2));
+            }
+            // Reverse span bakes the theme current at parse time — this line
+            // should swap against the theme just applied.
+            ChatControl.AddLine($"theme now {(_lightTheme ? "light" : "dark")}: {Esc}[7mreverse{Esc}[27m plain");
         }
 
         private void WorkerLoop(int targetRate)
