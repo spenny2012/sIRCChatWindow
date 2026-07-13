@@ -223,6 +223,15 @@ namespace IrcChatWpf
             ChatControl.AddLine($"font now: {family} {size}pt");
         }
 
+        private bool _capped;
+
+        private void OnCapClick(object sender, RoutedEventArgs e)
+        {
+            _capped = !_capped;
+            ChatControl.SetMaxLines(_capped ? 100 : 50000);
+            CapButton.Content = _capped ? "Uncap" : "Cap 100";
+        }
+
         private void WorkerLoop(int targetRate)
         {
             var sw = Stopwatch.StartNew();

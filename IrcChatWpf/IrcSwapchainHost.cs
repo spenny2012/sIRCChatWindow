@@ -24,6 +24,7 @@ namespace IrcChatWpf
         private uint _selectionArgb = 0x59598CF2;
         private string _fontFamily = "Consolas";
         private float _fontSize = 14f;
+        private uint _maxLines = 50000;
 
         public IrcSwapchainHost(int pixelWidth, int pixelHeight, double dpiScale)
         {
@@ -47,6 +48,7 @@ namespace IrcChatWpf
             NativeMethods.SetSelectionColor(_renderer, _selectionArgb);
             NativeMethods.SetFontFamily(_renderer, _fontFamily);
             NativeMethods.SetFontSize(_renderer, _fontSize);
+            NativeMethods.SetMaxLines(_renderer, _maxLines);
 
             _timer = new DispatcherTimer(DispatcherPriority.Render)
             {
@@ -131,6 +133,13 @@ namespace IrcChatWpf
             _fontSize = size;
             if (_renderer != IntPtr.Zero)
                 NativeMethods.SetFontSize(_renderer, size);
+        }
+
+        public void SetMaxLines(uint maxLines)
+        {
+            _maxLines = maxLines;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetMaxLines(_renderer, maxLines);
         }
 
         public int LineCount => _renderer != IntPtr.Zero ? NativeMethods.GetLineCount(_renderer) : 0;

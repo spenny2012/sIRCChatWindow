@@ -71,7 +71,7 @@ uint32_t RingBuffer::Append(const LineSlot& slot) noexcept
             m_writeOffset = 0;
             break;
         }
-        if (m_count == IrcLineCapacity)
+        if (m_count >= m_maxLines)
         {
             evictedRows += EvictOldest();
             continue;
@@ -128,6 +128,20 @@ uint32_t RingBuffer::Append(const LineSlot& slot) noexcept
     ++m_count;
 
     m_writeOffset = start + recordBytes;
+    return evictedRows;
+}
+
+uint32_t RingBuffer::SetMaxLines(uint32_t maxLines) noexcept
+{
+    if (maxLines < 1)
+        maxLines = 1;
+    if (maxLines > IrcLineCapacity)
+        maxLines = IrcLineCapacity;
+    m_maxLines = maxLines;
+
+    uint32_t evictedRows = 0;
+    while (m_count > m_maxLines)
+        evictedRows += EvictOldest();
     return evictedRows;
 }
 

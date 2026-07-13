@@ -67,14 +67,20 @@ public:
     RingBuffer& operator=(const RingBuffer&) = delete;
 
     // Pack the scratch line into the arena, evicting oldest lines when the
-    // meta ring or the byte budget is exhausted. Returns the total wrapped
+    // line cap or the byte budget is exhausted. Returns the total wrapped
     // rows of the evicted lines so the caller can maintain its row total.
     uint32_t Append(const LineSlot& slot) noexcept;
+
+    // Runtime retention limit, clamped to [1, IrcLineCapacity] (the physical
+    // meta ring never reallocates). Shrinking evicts oldest lines down to the
+    // new cap immediately. Returns the total wrapped rows of the evicted
+    // lines (same contract as Append).
+    uint32_t SetMaxLines(uint32_t maxLines) noexcept;
 
     void Clear() noexcept;
 
     uint32_t Count() const noexcept { return m_count; }
-    uint32_t Capacity() const noexcept { return IrcLineCapacity; }
+    uint32_t Capacity() const noexcept { return m_maxLines; }
 
     // Lines evicted since construction/Clear. Absolute line id =
     // EvictedTotal() + logicalIndex; stable across eviction, so selection
@@ -105,6 +111,7 @@ private:
 
     std::unique_ptr<LineMeta[]> m_meta;
     char*                       m_arena = nullptr; // VirtualAlloc reserve; committed on demand
+    uint32_t                    m_maxLines = IrcLineCapacity; // logical cap; ring stays physical
     uint32_t                    m_committedBytes = 0;
     uint32_t                    m_head = 0;        // meta index of oldest line
     uint32_t                    m_count = 0;

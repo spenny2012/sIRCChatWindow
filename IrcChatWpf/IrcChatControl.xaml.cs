@@ -18,6 +18,7 @@ namespace IrcChatWpf
         private Color? _selectionColor;
         private string _fontFamily; // null = use the native default (Consolas)
         private double? _fontSize;
+        private int? _maxLines;
         private readonly DispatcherTimer _dragScrollTimer;
 
         public IrcChatControl()
@@ -124,6 +125,20 @@ namespace IrcChatWpf
             _ircHost?.SetFontSize((float)size);
         }
 
+        /// <summary>Sets the scrollback retention limit. Once reached, the
+        /// oldest lines are evicted as new lines arrive at the bottom.
+        /// Clamped natively to [1, 50000]; the 16 MiB text arena can evict
+        /// earlier for extremely long lines. Shrinking below the current
+        /// line count evicts immediately. Non-positive values are ignored.
+        /// Safe to call before the control is loaded.</summary>
+        public void SetMaxLines(int maxLines)
+        {
+            if (maxLines <= 0)
+                return;
+            _maxLines = maxLines;
+            _ircHost?.SetMaxLines((uint)maxLines);
+        }
+
         // Opaque: the swapchain has no per-pixel alpha, so a translucent
         // default would silently misrender.
         private static uint PackArgb(Color c) =>
@@ -169,6 +184,7 @@ namespace IrcChatWpf
                 if (_selectionColor is Color sel) _ircHost.SetSelectionColor(PackArgba(sel));
                 if (_fontFamily != null) _ircHost.SetFontFamily(_fontFamily);
                 if (_fontSize is double fs) _ircHost.SetFontSize((float)fs);
+                if (_maxLines is int ml) _ircHost.SetMaxLines((uint)ml);
                 _ircHost.FrameRendered += OnFrameRendered;
                 ImageHost.Child = _ircHost;
             }

@@ -59,6 +59,11 @@ public:
     void SetFontFamily(const wchar_t* family);
     void SetFontSize(float size);
 
+    // Scrollback retention limit, clamped to [1, IrcLineCapacity]. Once
+    // reached, the oldest lines are evicted as new lines arrive; shrinking
+    // evicts immediately. UI-thread only, like SetSize/Clear.
+    void SetMaxLines(uint32_t maxLines);
+
     // Selection: coordinates are viewport-relative DIPs. Begin freezes
     // auto-scroll for the duration of the drag; End clears the selection and
     // restores it. GetText with buf == nullptr returns the required UTF-8
@@ -225,6 +230,7 @@ extern "C" __declspec(dllexport) void SetForegroundColor(Renderer* renderer, uin
 extern "C" __declspec(dllexport) void SetSelectionColor(Renderer* renderer, uint32_t argb);
 extern "C" __declspec(dllexport) void SetFontFamily(Renderer* renderer, const wchar_t* family);
 extern "C" __declspec(dllexport) void SetFontSize(Renderer* renderer, float size);
+extern "C" __declspec(dllexport) void SetMaxLines(Renderer* renderer, uint32_t maxLines);
 extern "C" __declspec(dllexport) int GetLineCount(Renderer* renderer);
 // "Chat" prefix avoids an extern "C" clash with the Win32 GetScrollInfo in winuser.h.
 extern "C" __declspec(dllexport) void GetChatScrollInfo(Renderer* renderer, float* contentHeight,

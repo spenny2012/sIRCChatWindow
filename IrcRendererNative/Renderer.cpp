@@ -1446,6 +1446,13 @@ void Renderer::SetFontSize(float size)
     m_dirty = true;
 }
 
+void Renderer::SetMaxLines(uint32_t maxLines)
+{
+    m_totalRows -= m_ringBuffer.SetMaxLines(maxLines); // rows of evicted lines
+    ClampScroll(); // content may have shrunk under the current offset
+    m_dirty = true;
+}
+
 void Renderer::GetScrollInfo(float* contentHeight, float* viewportHeight,
     float* scrollOffset, float* lineHeight, int* pinned) const
 {
@@ -1539,6 +1546,11 @@ extern "C" __declspec(dllexport) void SetFontFamily(Renderer* renderer, const wc
 extern "C" __declspec(dllexport) void SetFontSize(Renderer* renderer, float size)
 {
     if (renderer) renderer->SetFontSize(size);
+}
+
+extern "C" __declspec(dllexport) void SetMaxLines(Renderer* renderer, uint32_t maxLines)
+{
+    if (renderer) renderer->SetMaxLines(maxLines);
 }
 
 extern "C" __declspec(dllexport) void Clear(Renderer* renderer)

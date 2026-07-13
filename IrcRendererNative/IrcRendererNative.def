@@ -15,6 +15,7 @@ EXPORTS
     SetSelectionColor
     SetFontFamily
     SetFontSize
+    SetMaxLines
     GetLineCount
     GetChatScrollInfo
     SelectionBegin

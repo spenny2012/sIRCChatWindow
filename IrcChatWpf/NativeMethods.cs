@@ -57,6 +57,9 @@ namespace IrcChatWpf
         public static extern void SetFontSize(IntPtr renderer, float size);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SetMaxLines(IntPtr renderer, uint maxLines);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int GetLineCount(IntPtr renderer);
 
         [DllImport(DllName, EntryPoint = "GetChatScrollInfo", CallingConvention = CallingConvention.Cdecl)]
