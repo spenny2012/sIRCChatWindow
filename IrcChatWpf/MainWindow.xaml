@@ -19,6 +19,7 @@
                 <Button Content="Clear" Click="OnClearClick" Width="60" Margin="4,0" />
                 <Button Content="Test Pattern" Click="OnTestPatternClick" Width="90" Margin="4,0" />
                 <Button Content="Theme" Click="OnThemeClick" Width="60" Margin="4,0" />
+                <Button Content="Font" Click="OnFontClick" Width="60" Margin="4,0" />
                 <TextBlock Text="Rate (lines/sec):" Foreground="White" VerticalAlignment="Center" Margin="8,0,2,0" />
                 <TextBox x:Name="RateTextBox" Text="2000" Width="60" VerticalAlignment="Center" Margin="2,0" />
                 <TextBlock x:Name="StatsText" Text="Lines: 0" Foreground="White" VerticalAlignment="Center" Margin="8,0,0,0" />

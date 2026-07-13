@@ -21,6 +21,9 @@ namespace IrcChatWpf
         // Defaults mirror the native renderer's initial theme (IrcPalette).
         private uint _fgArgb = 0xFFF2F2F2;
         private uint _bgArgb = 0xFF141414;
+        private uint _selectionArgb = 0x59598CF2;
+        private string _fontFamily = "Consolas";
+        private float _fontSize = 14f;
 
         public IrcSwapchainHost(int pixelWidth, int pixelHeight, double dpiScale)
         {
@@ -41,6 +44,9 @@ namespace IrcChatWpf
             // Colors may have been set before the native renderer existed.
             NativeMethods.SetBackgroundColor(_renderer, _bgArgb);
             NativeMethods.SetForegroundColor(_renderer, _fgArgb);
+            NativeMethods.SetSelectionColor(_renderer, _selectionArgb);
+            NativeMethods.SetFontFamily(_renderer, _fontFamily);
+            NativeMethods.SetFontSize(_renderer, _fontSize);
 
             _timer = new DispatcherTimer(DispatcherPriority.Render)
             {
@@ -105,6 +111,28 @@ namespace IrcChatWpf
             if (_renderer != IntPtr.Zero)
                 NativeMethods.SetForegroundColor(_renderer, argb);
         }
+
+        public void SetSelectionColor(uint argb)
+        {
+            _selectionArgb = argb;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetSelectionColor(_renderer, argb);
+        }
+
+        public void SetFontFamily(string family)
+        {
+            _fontFamily = family;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetFontFamily(_renderer, family);
+        }
+
+        public void SetFontSize(float size)
+        {
+            _fontSize = size;
+            if (_renderer != IntPtr.Zero)
+                NativeMethods.SetFontSize(_renderer, size);
+        }
+
         public int LineCount => _renderer != IntPtr.Zero ? NativeMethods.GetLineCount(_renderer) : 0;
 
         public void SelectionBegin(double xDips, double yDips) { if (_renderer != IntPtr.Zero) NativeMethods.SelectionBegin(_renderer, (float)xDips, (float)yDips); }

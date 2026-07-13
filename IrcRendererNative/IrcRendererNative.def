@@ -12,6 +12,9 @@ EXPORTS
     Clear
     SetBackgroundColor
     SetForegroundColor
+    SetSelectionColor
+    SetFontFamily
+    SetFontSize
     GetLineCount
     GetChatScrollInfo
     SelectionBegin

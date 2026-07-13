@@ -22,6 +22,10 @@ struct Segment
 
 static_assert(sizeof(Segment) == 12, "Segment layout is the arena record format");
 
+// Per-line flags (LineSlot/LineMeta/LineView). NonAscii gates the UTF-8
+// cluster-aware layout paths; pure-ASCII lines keep the byte==cell fast path.
+constexpr uint8_t LineFlagNonAscii = 0x01;
+
 // Ingest scratch: IrcParser::Parse fills one of these on the stack, then
 // RingBuffer::Append packs the used portion into the arena. Never stored.
 struct LineSlot
@@ -32,6 +36,7 @@ struct LineSlot
     uint16_t length;
     uint16_t rowCount;      // wrapped visual rows at the current column width
     uint8_t  segmentCount;
+    uint8_t  flags;         // LineFlag* bits
 };
 
 static_assert(sizeof(LineSlot) <= 720, "LineSlot should stay compact");
@@ -45,6 +50,7 @@ struct LineView
     uint16_t       length;
     uint16_t       rowCount;
     uint8_t        segmentCount;
+    uint8_t        flags;
 };
 
 // Scrollback storage: fixed per-line metadata ring plus a byte arena holding
@@ -87,6 +93,7 @@ private:
         uint16_t length;
         uint16_t rowCount;
         uint8_t  segmentCount;
+        uint8_t  flags;
     };
 
     // Drops the oldest line; returns its rowCount.

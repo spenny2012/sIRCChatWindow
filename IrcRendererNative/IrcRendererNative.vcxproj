@@ -100,6 +100,7 @@
     <ClInclude Include="IrcParser.h" />
     <ClInclude Include="Palette.h" />
     <ClInclude Include="Renderer.h" />
+    <ClInclude Include="TextCells.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />

@@ -156,6 +156,29 @@ namespace IrcChatWpf
             ChatControl.AddLine($"inline: A{Esc}[999mB {Esc}[38;5mC {Esc}[2JD {Esc}]0;osc-titleE");
             ChatControl.AddLine($"truncated CSI at EOL (line should end at the colon): {Esc}[12;");
             ChatControl.AddLine($"bare ESC at EOL: ok{Esc}");
+
+            // Emoji/CJK cell-model checks. Escapes only: this file has no BOM
+            // and already carries raw control bytes, so keep it ASCII-safe.
+            ChatControl.AddLine("=== emoji ===");
+            // Grid ruler: on the line below it, c must land under '4', e
+            // under '8', g under the '2' of "12" if 2-cell emoji are exact.
+            ChatControl.AddLine("ruler: 0123456789012345678901234567890123456789");
+            ChatControl.AddLine("ruler: ab\U0001F600cd\U0001F601ef\U0001F602gh end-grid");
+            ChatControl.AddLine("smileys: \U0001F600 \U0001F601 \U0001F602 \U0001F923 \U0001F60D end");
+            ChatControl.AddLine("3-byte: heart-text ❤ heart-vs16 ❤️ sun ☀ check ✔️ star ⭐ end");
+            ChatControl.AddLine("flags: US \U0001F1FA\U0001F1F8 JP \U0001F1EF\U0001F1F5 lone-RI \U0001F1E6 end");
+            ChatControl.AddLine("skin: \U0001F44D \U0001F44D\U0001F3FD \U0001F44D\U0001F3FF end");
+            ChatControl.AddLine("zwj: family \U0001F468‍\U0001F469‍\U0001F467 rainbow-flag \U0001F3F3️‍\U0001F308 end");
+            ChatControl.AddLine("keycap: 1️⃣ combining: é (e + U+0301) end");
+            ChatControl.AddLine("cjk: ab你好cd日本語ef한국어gh end");
+            ChatControl.AddLine("mixed-mirc: 04red \U0001F600 red plain 08,02\U0001F31F on-navy end");
+            ChatControl.AddLine($"mixed-ansi: {Esc}[32mgreen \U0001F600 green{Esc}[0m {Esc}[1;35m\U0001F49C bold-purple{Esc}[0m end");
+            ChatControl.AddLine($"csi-abandon: {Esc}[38;5;\U0001F600 must show emoji, no residue");
+            sb.Clear();
+            sb.Append("wrap-test: ");
+            for (int k = 0; k < 30; ++k)
+                sb.Append("\U0001F600\U0001F389❤️ ");
+            ChatControl.AddLine(sb.ToString()); // ~461 UTF-8 bytes: wraps, breaks at cluster starts
         }
 
         private bool _lightTheme;
@@ -167,15 +190,37 @@ namespace IrcChatWpf
             {
                 ChatControl.SetBackgroundColor(Color.FromRgb(0xFA, 0xFA, 0xFA));
                 ChatControl.SetForegroundColor(Color.FromRgb(0x1A, 0x1A, 0x1A));
+                ChatControl.SetSelectionColor(Color.FromArgb(0x59, 0xFF, 0x8C, 0x00)); // translucent amber
             }
             else
             {
                 ChatControl.SetBackgroundColor(Color.FromRgb(0x14, 0x14, 0x14));
                 ChatControl.SetForegroundColor(Color.FromRgb(0xF2, 0xF2, 0xF2));
+                ChatControl.SetSelectionColor(Color.FromArgb(0x59, 0x59, 0x8C, 0xF2)); // translucent blue (default)
             }
             // Reverse span bakes the theme current at parse time — this line
             // should swap against the theme just applied.
             ChatControl.AddLine($"theme now {(_lightTheme ? "light" : "dark")}: {Esc}[7mreverse{Esc}[27m plain");
+        }
+
+        private int _fontPreset;
+
+        // Cycles: default monospace -> larger monospace -> non-monospace (to
+        // visually demonstrate the accepted uneven-spacing limitation).
+        private void OnFontClick(object sender, RoutedEventArgs e)
+        {
+            _fontPreset = (_fontPreset + 1) % 3;
+            string family;
+            double size;
+            switch (_fontPreset)
+            {
+                case 1: family = "Cascadia Mono"; size = 18; break;
+                case 2: family = "Times New Roman"; size = 20; break;
+                default: family = "Consolas"; size = 14; break;
+            }
+            ChatControl.SetFontFamily(family);
+            ChatControl.SetFontSize(size);
+            ChatControl.AddLine($"font now: {family} {size}pt");
         }
 
         private void WorkerLoop(int targetRate)

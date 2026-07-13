@@ -232,6 +232,7 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
     Style st;
     uint16_t segmentStart = 0;
     uint16_t i = 0;
+    unsigned char high = 0; // any stored byte >= 0x80 marks the line non-ASCII
 
     while (i < length)
     {
@@ -299,9 +300,11 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
         if (slot->length < IrcLineTextSize)
         {
             slot->text[slot->length++] = c;
+            high |= static_cast<unsigned char>(c);
         }
         ++i;
     }
 
     FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
+    slot->flags = (high & 0x80) ? LineFlagNonAscii : 0; // assign: scratch slot is reused
 }

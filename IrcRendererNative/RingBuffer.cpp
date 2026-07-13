@@ -124,6 +124,7 @@ uint32_t RingBuffer::Append(const LineSlot& slot) noexcept
     meta.length = slot.length;
     meta.rowCount = slot.rowCount;
     meta.segmentCount = slot.segmentCount;
+    meta.flags = slot.flags;
     ++m_count;
 
     m_writeOffset = start + recordBytes;
@@ -151,6 +152,7 @@ LineView RingBuffer::Get(uint32_t logicalIndex) const noexcept
     view.length = meta.length;
     view.rowCount = meta.rowCount;
     view.segmentCount = meta.segmentCount;
+    view.flags = meta.flags;
     return view;
 }
 

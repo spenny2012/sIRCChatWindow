@@ -15,6 +15,9 @@ namespace IrcChatWpf
         private bool _selecting;
         private Color? _fgColor; // set before the host exists → applied on creation
         private Color? _bgColor;
+        private Color? _selectionColor;
+        private string _fontFamily; // null = use the native default (Consolas)
+        private double? _fontSize;
         private readonly DispatcherTimer _dragScrollTimer;
 
         public IrcChatControl()
@@ -70,7 +73,9 @@ namespace IrcChatWpf
         public void SetBackgroundColor(Color color)
         {
             _bgColor = color;
-            ImageHost.Background = new SolidColorBrush(color);
+            var brush = new SolidColorBrush(color);
+            brush.Freeze(); // frozen brushes skip change-tracking overhead
+            ImageHost.Background = brush;
             _ircHost?.SetBackgroundColor(PackArgb(color));
         }
 
@@ -83,10 +88,49 @@ namespace IrcChatWpf
             _ircHost?.SetForegroundColor(PackArgb(color));
         }
 
+        /// <summary>Sets the tint drawn over selected text during mouse-drag
+        /// selection. Unlike the background/foreground colors, the alpha
+        /// channel is respected (not forced opaque) so the tint can overlay
+        /// already-drawn glyphs. Safe to call before the control is
+        /// loaded.</summary>
+        public void SetSelectionColor(Color color)
+        {
+            _selectionColor = color;
+            _ircHost?.SetSelectionColor(PackArgba(color));
+        }
+
+        /// <summary>Sets the rendering font family (e.g. "Cascadia Mono").
+        /// Null/empty is ignored. Applies immediately: rebuilds glyph layout
+        /// and re-wraps all scrollback, since word-wrap is column-based on the
+        /// font's monospace advance width. A non-monospace font is allowed but
+        /// renders with uneven glyph spacing (layout stays fixed-column).
+        /// Safe to call before the control is loaded.</summary>
+        public void SetFontFamily(string fontFamily)
+        {
+            if (string.IsNullOrEmpty(fontFamily))
+                return;
+            _fontFamily = fontFamily;
+            _ircHost?.SetFontFamily(fontFamily);
+        }
+
+        /// <summary>Sets the rendering font size in DIPs. Non-positive values
+        /// are ignored. Applies immediately, like <see cref="SetFontFamily"/>.
+        /// Safe to call before the control is loaded.</summary>
+        public void SetFontSize(double size)
+        {
+            if (size <= 0.0)
+                return;
+            _fontSize = size;
+            _ircHost?.SetFontSize((float)size);
+        }
+
         // Opaque: the swapchain has no per-pixel alpha, so a translucent
         // default would silently misrender.
         private static uint PackArgb(Color c) =>
             0xFF000000u | (uint)c.R << 16 | (uint)c.G << 8 | c.B;
+
+        private static uint PackArgba(Color c) =>
+            (uint)c.A << 24 | (uint)c.R << 16 | (uint)c.G << 8 | c.B;
 
         private void OnSizeChanged(object sender, SizeChangedEventArgs e)
         {
@@ -122,6 +166,9 @@ namespace IrcChatWpf
                 _ircHost = new IrcSwapchainHost(px, py, dpi.DpiScaleX);
                 if (_bgColor is Color bg) _ircHost.SetBackgroundColor(PackArgb(bg));
                 if (_fgColor is Color fg) _ircHost.SetForegroundColor(PackArgb(fg));
+                if (_selectionColor is Color sel) _ircHost.SetSelectionColor(PackArgba(sel));
+                if (_fontFamily != null) _ircHost.SetFontFamily(_fontFamily);
+                if (_fontSize is double fs) _ircHost.SetFontSize((float)fs);
                 _ircHost.FrameRendered += OnFrameRendered;
                 ImageHost.Child = _ircHost;
             }

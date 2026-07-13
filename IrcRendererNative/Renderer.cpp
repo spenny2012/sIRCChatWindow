@@ -2,13 +2,12 @@
 #include "Renderer.h"
 #include "IrcParser.h"
 #include "Palette.h"
+#include "TextCells.h"
 
 #include <cmath>
 
 namespace
 {
-    const wchar_t* FontFamily = L"Consolas";
-    constexpr float FontSize = 14.0f;
     constexpr float LineHeightRatio = 1.25f;
     // Per-frame drain cap: at 60 fps this absorbs ~61k lines/s of flood while
     // costing well under a millisecond (ingest is parse + wrap arithmetic only).
@@ -82,8 +81,10 @@ namespace
     // where row r begins, rowStarts[rows] == length), so row r renders the range
     // [rowStarts[r], rowStarts[r+1]). Used both when committing a line (count
     // only) and when rendering it (with rowStarts) — they must never disagree.
-    uint16_t ComputeWrapRows(const char* text, uint16_t length, int cols, int contCols,
-        uint16_t* rowStarts, uint16_t maxRows)
+    // asciiOnly (the stored per-line flag) selects the byte==cell fast path;
+    // otherwise the budget is in cells and rows only break at cluster starts.
+    uint16_t ComputeWrapRows(const char* text, uint16_t length, bool asciiOnly,
+        int cols, int contCols, uint16_t* rowStarts, uint16_t maxRows)
     {
         if (cols < 1) cols = 1;
         if (contCols < 1) contCols = 1;
@@ -91,32 +92,93 @@ namespace
 
         uint16_t rows = 0;
         uint16_t pos = 0;
+
+        if (asciiOnly)
+        {
+            for (;;)
+            {
+                if (rowStarts)
+                    rowStarts[rows] = pos;
+
+                const int budget = (rows == 0) ? cols : contCols;
+                const int remaining = static_cast<int>(length) - static_cast<int>(pos);
+                ++rows;
+
+                if (remaining <= budget || rows >= maxRows)
+                    break;
+
+                // Break after the last space that fits. A space landing exactly on
+                // the boundary hangs invisibly off the row end (i == budget + 1), so
+                // the full row of text is kept. Hard-break mid-word only when no
+                // space fits at all.
+                uint16_t rowLen = static_cast<uint16_t>(budget);
+                for (int i = budget + 1; i >= 1; --i)
+                {
+                    if (text[pos + i - 1] == ' ')
+                    {
+                        rowLen = static_cast<uint16_t>(i);
+                        break;
+                    }
+                }
+                pos = static_cast<uint16_t>(pos + rowLen);
+            }
+
+            if (rowStarts)
+                rowStarts[rows] = length;
+            return rows;
+        }
+
+        // Cluster path: forward walk mirroring the ASCII rules exactly when
+        // every cluster is one byte/one cell (last-space-wins break, space
+        // hanging off the row end, hard break when no space fits).
         for (;;)
         {
             if (rowStarts)
                 rowStarts[rows] = pos;
 
             const int budget = (rows == 0) ? cols : contCols;
-            const int remaining = static_cast<int>(length) - static_cast<int>(pos);
             ++rows;
+            if (rows >= maxRows)
+                break; // remainder lands on this final row
 
-            if (remaining <= budget || rows >= maxRows)
-                break;
-
-            // Break after the last space that fits. A space landing exactly on
-            // the boundary hangs invisibly off the row end (i == budget + 1), so
-            // the full row of text is kept. Hard-break mid-word only when no
-            // space fits at all.
-            uint16_t rowLen = static_cast<uint16_t>(budget);
-            for (int i = budget + 1; i >= 1; --i)
+            int cells = 0;
+            uint16_t i = pos;
+            uint16_t lastSpaceEnd = 0; // byte pos just past the rightmost break space
+            uint16_t fitEnd = pos;     // end of the clusters that fit the budget
+            bool exhausted = false;
+            for (;;)
             {
-                if (text[pos + i - 1] == ' ')
+                if (i >= length)
                 {
-                    rowLen = static_cast<uint16_t>(i);
+                    exhausted = true;
                     break;
                 }
+                const TextCells::Cluster cl = TextCells::NextCluster(text, i, length);
+                if (cells + cl.cells > budget)
+                {
+                    // The hanging-space rule: a space as the first overflowing
+                    // cell hangs invisibly off the row end.
+                    if (text[i] == ' ' && cells == budget)
+                        lastSpaceEnd = static_cast<uint16_t>(i + 1);
+                    break;
+                }
+                cells += cl.cells;
+                i = static_cast<uint16_t>(i + cl.bytes);
+                fitEnd = i;
+                if (cl.bytes == 1 && text[i - 1] == ' ')
+                    lastSpaceEnd = i;
             }
-            pos = static_cast<uint16_t>(pos + rowLen);
+            if (exhausted)
+                break; // everything remaining fits this row
+
+            uint16_t rowEnd;
+            if (lastSpaceEnd != 0)
+                rowEnd = lastSpaceEnd;
+            else if (fitEnd > pos)
+                rowEnd = fitEnd;
+            else // budget smaller than the first cluster: force progress
+                rowEnd = static_cast<uint16_t>(pos + TextCells::NextCluster(text, pos, length).bytes);
+            pos = rowEnd;
         }
 
         if (rowStarts)
@@ -169,13 +231,13 @@ void Renderer::Shutdown()
 }
 
 // Everything holding a reference to the swapchain's back buffer — required
-// to be released before ResizeBuffers (brushes are bound to the target).
+// to be released before ResizeBuffers. The device context, its brushes, and
+// D2D's device-level caches deliberately persist across resizes.
 void Renderer::ReleaseBackBufferResources()
 {
-    SafeRelease(m_scratchBrush);
-    SafeRelease(m_defaultFgBrush);
-    SafeRelease(m_selectionBrush);
-    SafeRelease(m_renderTarget);
+    if (m_renderTarget)
+        m_renderTarget->SetTarget(nullptr);
+    SafeRelease(m_targetBitmap);
     SafeRelease(m_surface);
 }
 
@@ -186,8 +248,15 @@ void Renderer::ReleaseDeviceResources()
         SafeRelease(f);
     }
     SafeRelease(m_fontFace);
+    ClearClusterCache(); // layouts are factory objects: release before it
     SafeRelease(m_dwriteFactory);
+    SafeRelease(m_scratchBrush);
+    SafeRelease(m_defaultFgBrush);
+    SafeRelease(m_selectionBrush);
     ReleaseBackBufferResources();
+    SafeRelease(m_atlasContext);
+    SafeRelease(m_renderTarget);
+    SafeRelease(m_d2dDevice);
     SafeRelease(m_d2dFactory);
     SafeRelease(m_swapChain);
     SafeRelease(m_d3dContext);
@@ -293,25 +362,77 @@ bool Renderer::CreateRenderTargetFromBackBuffer()
 
 bool Renderer::CreateD2DRenderTarget()
 {
-    // The factory is device-independent and survives render-target recreation;
-    // creating a new one on every SetSize would leak the previous instance.
+    // One-time: factory -> device -> device context. These persist across
+    // resizes so D2D's device-level glyph/rasterization caches (color emoji
+    // re-rasterization is expensive) and the brushes survive; only the target
+    // bitmap below rebinds per resize.
     if (!m_d2dFactory)
     {
         HRESULT hrFactory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_d2dFactory);
         if (FAILED(hrFactory))
             return false;
     }
+    if (!m_renderTarget)
+    {
+        ID2D1Factory1* factory1 = nullptr;
+        if (FAILED(m_d2dFactory->QueryInterface(__uuidof(ID2D1Factory1),
+                reinterpret_cast<void**>(&factory1))) || !factory1)
+            return false;
 
-    D2D1_RENDER_TARGET_PROPERTIES props = {};
-    props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        IDXGIDevice* dxgiDevice = nullptr;
+        HRESULT hr = m_d3d11Device->QueryInterface(__uuidof(IDXGIDevice),
+            reinterpret_cast<void**>(&dxgiDevice));
+        if (SUCCEEDED(hr))
+        {
+            hr = factory1->CreateDevice(dxgiDevice, &m_d2dDevice);
+            dxgiDevice->Release();
+        }
+        factory1->Release();
+        if (FAILED(hr))
+            return false;
+
+        if (FAILED(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                &m_renderTarget)))
+            return false;
+
+        // Atlas context: renders cluster bitmaps while the main context is
+        // inside BeginDraw. Grayscale AA — ClearType needs an opaque
+        // backing, and atlas bitmaps are transparent.
+        if (FAILED(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                &m_atlasContext)))
+            return false;
+        m_atlasContext->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+        // Color emoji (COLR glyphs) need the D2D 1.3 pipeline;
+        // ID2D1DeviceContext4 signposts it. DrawText returns void, so gate
+        // the flag on this probe instead of passing it blind.
+        m_drawTextOptions = D2D1_DRAW_TEXT_OPTIONS_CLIP;
+        ID2D1DeviceContext4* dc4 = nullptr;
+        if (SUCCEEDED(m_renderTarget->QueryInterface(__uuidof(ID2D1DeviceContext4),
+                reinterpret_cast<void**>(&dc4))) && dc4)
+        {
+            m_drawTextOptions = static_cast<D2D1_DRAW_TEXT_OPTIONS>(
+                m_drawTextOptions | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            dc4->Release();
+        }
+    }
+
+    // Per-resize: bind the swapchain's back-buffer surface as the target.
+    // Layout math stays in DIPs; the DPI maps DIPs onto the pixel surface.
+    D2D1_BITMAP_PROPERTIES1 props = {};
     props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    // Layout math stays in DIPs; the target maps DIPs onto the pixel-sized surface.
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
     props.dpiX = 96.0f * m_dpiScale;
     props.dpiY = 96.0f * m_dpiScale;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
-    HRESULT hr = m_d2dFactory->CreateDxgiSurfaceRenderTarget(m_surface, &props, &m_renderTarget);
-    return SUCCEEDED(hr);
+    ID2D1Bitmap1* bitmap = nullptr;
+    if (FAILED(m_renderTarget->CreateBitmapFromDxgiSurface(m_surface, &props, &bitmap)))
+        return false;
+    m_renderTarget->SetTarget(bitmap);
+    m_targetBitmap = bitmap;
+    m_renderTarget->SetDpi(96.0f * m_dpiScale, 96.0f * m_dpiScale);
+    return true;
 }
 
 bool Renderer::CreateDWriteResources()
@@ -321,14 +442,19 @@ bool Renderer::CreateDWriteResources()
     if (FAILED(hr))
         return false;
 
+    return BuildFontResources();
+}
+
+bool Renderer::BuildFontResources()
+{
     for (int i = 0; i < 4; ++i)
     {
         DWRITE_FONT_WEIGHT weight = (i & 0x01) ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
         DWRITE_FONT_STYLE style = (i & 0x02) ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
 
         IDWriteTextFormat* format = nullptr;
-        hr = m_dwriteFactory->CreateTextFormat(FontFamily, nullptr, weight, style,
-            DWRITE_FONT_STRETCH_NORMAL, FontSize, L"", &format);
+        HRESULT hr = m_dwriteFactory->CreateTextFormat(m_fontFamily.c_str(), nullptr, weight, style,
+            DWRITE_FONT_STRETCH_NORMAL, m_fontSize, L"", &format);
         if (FAILED(hr))
             return false;
 
@@ -341,7 +467,7 @@ bool Renderer::CreateDWriteResources()
     // Column-based wrap math relies on the monospace advance width; measure one
     // character rather than trusting a hard-coded ratio.
     const float charWidth = MeasureSegment("0", 1, 0);
-    m_charWidthDips = charWidth > 0.0f ? charWidth : FontSize * 0.6f;
+    m_charWidthDips = charWidth > 0.0f ? charWidth : m_fontSize * 0.6f;
 
     // Attempt to cache a font face for the normal style.
     IDWriteFontCollection* collection = nullptr;
@@ -349,7 +475,7 @@ bool Renderer::CreateDWriteResources()
     {
         UINT32 index = 0;
         BOOL exists = FALSE;
-        if (SUCCEEDED(collection->FindFamilyName(FontFamily, &index, &exists)) && exists)
+        if (SUCCEEDED(collection->FindFamilyName(m_fontFamily.c_str(), &index, &exists)) && exists)
         {
             IDWriteFontFamily* family = nullptr;
             if (SUCCEEDED(collection->GetFontFamily(index, &family)))
@@ -367,13 +493,32 @@ bool Renderer::CreateDWriteResources()
         collection->Release();
     }
 
+    // Pin every DrawText call — primary font or emoji fallback — to one
+    // baseline, so per-cluster chunk draws (DrawSegment) line up. For the
+    // primary font this reproduces default spacing exactly: its natural line
+    // box starts at the layout-rect top with the baseline at its ascent.
+    m_baselineY = m_fontSize * 0.8f;
+    if (m_fontFace)
+    {
+        DWRITE_FONT_METRICS metrics = {};
+        m_fontFace->GetMetrics(&metrics);
+        if (metrics.designUnitsPerEm > 0)
+            m_baselineY = metrics.ascent *
+                (m_fontSize / static_cast<float>(metrics.designUnitsPerEm));
+    }
+    for (auto* f : m_textFormats)
+    {
+        if (f)
+            f->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, m_lineHeight, m_baselineY);
+    }
+
     return true;
 }
 
 void Renderer::UpdateLineHeight()
 {
-    m_lineHeight = FontSize * LineHeightRatio;
-    m_underlineY = FontSize * 1.1f;
+    m_lineHeight = m_fontSize * LineHeightRatio;
+    m_underlineY = m_fontSize * 1.1f;
     m_underlineThickness = 1.0f;
     if (m_fontFace)
     {
@@ -381,7 +526,7 @@ void Renderer::UpdateLineHeight()
         m_fontFace->GetMetrics(&metrics);
         if (metrics.designUnitsPerEm > 0)
         {
-            const float ratio = FontSize / static_cast<float>(metrics.designUnitsPerEm);
+            const float ratio = m_fontSize / static_cast<float>(metrics.designUnitsPerEm);
             m_lineHeight = (metrics.ascent + metrics.descent + metrics.lineGap) * ratio;
             // underlinePosition is negative (below baseline).
             m_underlineY = (metrics.ascent - metrics.underlinePosition) * ratio;
@@ -404,7 +549,7 @@ void Renderer::EnsureBrushes()
     if (!m_selectionBrush)
     {
         // Translucent so the tint overlays the already-drawn glyphs.
-        D2D1_COLOR_F selColor = { 0.35f, 0.55f, 0.95f, 0.35f };
+        D2D1_COLOR_F selColor = ColorFromU32(m_selectionColor);
         m_renderTarget->CreateSolidColorBrush(&selColor, nullptr, &m_selectionBrush);
     }
     if (!m_scratchBrush)
@@ -420,6 +565,106 @@ IDWriteTextFormat* Renderer::GetTextFormat(uint8_t flags) const
     return m_textFormats[index];
 }
 
+ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
+    uint8_t fmtIndex, uint8_t cells, uint32_t fgArgb)
+{
+    if (len == 0 || len > ClusterKeyMaxLen || !m_dwriteFactory || !m_atlasContext)
+        return nullptr;
+
+    // FNV-1a over the UTF-16 units + format index + color.
+    uint32_t h = 2166136261u;
+    for (uint16_t k = 0; k < len; ++k)
+    {
+        h ^= static_cast<uint16_t>(key[k]);
+        h *= 16777619u;
+    }
+    h ^= fmtIndex;
+    h *= 16777619u;
+    h ^= fgArgb;
+    h *= 16777619u;
+
+    ClusterEntry& e = m_clusterCache[h & (ClusterCacheSize - 1)];
+    if (e.bitmap && e.keyLen == len && e.fmt == fmtIndex && e.fgArgb == fgArgb &&
+        std::memcmp(e.key, key, len * sizeof(wchar_t)) == 0)
+        return e.bitmap;
+
+    IDWriteTextFormat* format = GetTextFormat(fmtIndex);
+    if (!format)
+        return nullptr;
+
+    // Box: +1 cell of width slack preserves the natural-advance overhang;
+    // one line height reproduces DrawText's vertical clamp. NO_WRAP and the
+    // uniform line spacing are inherited from the format, so the baseline
+    // inside the bitmap matches direct drawing.
+    const float wDips = static_cast<float>(cells + 1) * m_charWidthDips;
+    const float hDips = m_lineHeight;
+
+    IDWriteTextLayout* layout = nullptr; // transient: shaping happens once here
+    if (FAILED(m_dwriteFactory->CreateTextLayout(key, len, format, wDips, hDips, &layout)) ||
+        !layout)
+        return nullptr;
+
+    D2D1_BITMAP_PROPERTIES1 props = {};
+    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 96.0f * m_dpiScale;
+    props.dpiY = 96.0f * m_dpiScale;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET; // drawable render target
+
+    const D2D1_SIZE_U px = {
+        static_cast<UINT32>(std::ceil(wDips * m_dpiScale)),
+        static_cast<UINT32>(std::ceil(hDips * m_dpiScale))
+    };
+    ID2D1Bitmap1* bitmap = nullptr;
+    HRESULT hr = m_atlasContext->CreateBitmap(px, nullptr, 0, &props, &bitmap);
+    if (FAILED(hr) || !bitmap)
+    {
+        layout->Release();
+        return nullptr;
+    }
+
+    // Render the cluster once on the atlas context (the main context may be
+    // inside BeginDraw; two contexts on one device draw independently and
+    // share the brushes). Color glyphs ignore the brush; monochrome fallback
+    // glyphs bake fgArgb, which is part of the cache key.
+    m_atlasContext->SetTarget(bitmap);
+    m_atlasContext->SetDpi(96.0f * m_dpiScale, 96.0f * m_dpiScale);
+    m_atlasContext->BeginDraw();
+    D2D1_COLOR_F clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+    m_atlasContext->Clear(&clear);
+    if (m_scratchBrush)
+    {
+        m_scratchBrush->SetColor(ColorFromU32(fgArgb));
+        m_atlasContext->DrawTextLayout(D2D1_POINT_2F{ 0.0f, 0.0f }, layout,
+            m_scratchBrush, m_drawTextOptions);
+    }
+    hr = m_atlasContext->EndDraw();
+    m_atlasContext->SetTarget(nullptr);
+    layout->Release();
+    if (FAILED(hr))
+    {
+        bitmap->Release();
+        return nullptr;
+    }
+
+    SafeRelease(e.bitmap); // direct-mapped: evict the collision victim
+    std::memcpy(e.key, key, len * sizeof(wchar_t));
+    e.keyLen = static_cast<uint8_t>(len);
+    e.fmt = fmtIndex;
+    e.fgArgb = fgArgb;
+    e.bitmap = bitmap;
+    return e.bitmap;
+}
+
+void Renderer::ClearClusterCache()
+{
+    for (auto& e : m_clusterCache)
+    {
+        SafeRelease(e.bitmap);
+        e.keyLen = 0;
+    }
+}
+
 float Renderer::MeasureSegment(const char* text, uint16_t length, uint8_t flags)
 {
     if (!m_dwriteFactory || length == 0)
@@ -429,7 +674,9 @@ float Renderer::MeasureSegment(const char* text, uint16_t length, uint8_t flags)
     if (!format)
         return 0.0f;
 
-    wchar_t buffer[IrcLineTextSize] = {};
+    // Deliberately uninitialized: only [0, length) is written, and the
+    // DWrite calls below receive the explicit length.
+    wchar_t buffer[IrcLineTextSize];
     for (uint16_t i = 0; i < length; ++i)
         buffer[i] = static_cast<wchar_t>(static_cast<unsigned char>(text[i]));
 
@@ -449,7 +696,7 @@ float Renderer::MeasureSegment(const char* text, uint16_t length, uint8_t flags)
 }
 
 void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
-    float segWidth, uint32_t fg, uint32_t bg, uint8_t flags)
+    float segWidth, uint32_t fg, uint32_t bg, uint8_t flags, bool asciiOnly)
 {
     if (!m_renderTarget || length == 0)
         return;
@@ -475,13 +722,81 @@ void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
         brush = m_scratchBrush;
     }
 
-    wchar_t buffer[IrcLineTextSize] = {};
-    for (uint16_t i = 0; i < length; ++i)
-        buffer[i] = static_cast<wchar_t>(static_cast<unsigned char>(text[i]));
+    // Deliberately uninitialized: only the written prefix is read, and the
+    // DWrite calls below receive explicit lengths. 512 UTF-8 bytes always
+    // decode to <= 512 UTF-16 units, so the buffer bound holds on all paths.
+    wchar_t buffer[IrcLineTextSize];
 
-    D2D1_RECT_F layoutRect = Rect(x, y, m_viewWidthDips - x, m_lineHeight);
-    m_renderTarget->DrawText(buffer, length, format, &layoutRect, brush,
-        D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    if (asciiOnly)
+    {
+        for (uint16_t i = 0; i < length; ++i)
+            buffer[i] = static_cast<wchar_t>(static_cast<unsigned char>(text[i]));
+
+        D2D1_RECT_F layoutRect = Rect(x, y, m_viewWidthDips - x, m_lineHeight);
+        m_renderTarget->DrawText(buffer, length, format, &layoutRect, brush,
+            m_drawTextOptions);
+    }
+    else
+    {
+        // Cell-grid chunking: contiguous ASCII draws as one DrawText; each
+        // non-ASCII cluster draws individually, re-anchored at its cell x so
+        // natural-advance mismatch never accumulates across the row. All
+        // chunks share one baseline via the formats' uniform line spacing.
+        uint16_t i = 0;
+        float cellX = 0.0f;
+        while (i < length)
+        {
+            if (!(static_cast<unsigned char>(text[i]) & 0x80))
+            {
+                uint16_t e = i;
+                while (e < length && !(static_cast<unsigned char>(text[e]) & 0x80))
+                    ++e;
+                // If the span is followed by a zero-width code point
+                // (combining mark, VS16, ZWJ), hand the last ASCII char to
+                // the cluster path so base + marks shape as one unit.
+                if (e < length && e > i &&
+                    TextCells::CellWidth(TextCells::DecodeUtf8(text, e, length).cp) == 0)
+                    --e;
+                if (e > i)
+                {
+                    for (uint16_t k = 0; k < e - i; ++k)
+                        buffer[k] = static_cast<wchar_t>(text[i + k]);
+                    D2D1_RECT_F rect = Rect(x + cellX, y, m_viewWidthDips - (x + cellX), m_lineHeight);
+                    m_renderTarget->DrawText(buffer, static_cast<UINT32>(e - i), format,
+                        &rect, brush, m_drawTextOptions);
+                    cellX += static_cast<float>(e - i) * m_charWidthDips;
+                    i = e;
+                    continue;
+                }
+                // Empty span: a lone ASCII char owned by a following
+                // zero-width mark — the cluster path below folds them.
+            }
+
+            const TextCells::Cluster cl = TextCells::NextCluster(text, i, length);
+            const uint16_t wlen = TextCells::Utf8ToUtf16(text + i, cl.bytes, buffer);
+            const uint32_t effFg = (fg & 0xFF000000u) ? fg : m_fgColor;
+            ID2D1Bitmap1* cached = GetClusterBitmap(buffer, wlen,
+                static_cast<uint8_t>(flags & 0x03), cl.cells, effFg);
+            if (cached)
+            {
+                // Pre-rasterized: per frame this is a plain bitmap blit —
+                // no shaping, no fallback, no color-glyph layer translation.
+                const D2D1_SIZE_F bs = cached->GetSize();
+                const D2D1_RECT_F dst = Rect(x + cellX, y, bs.width, bs.height);
+                m_renderTarget->DrawBitmap(cached, &dst, 1.0f,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, nullptr);
+            }
+            else
+            {
+                // Oversized cluster or creation failure: uncached path.
+                D2D1_RECT_F rect = Rect(x + cellX, y, m_viewWidthDips - (x + cellX), m_lineHeight);
+                m_renderTarget->DrawText(buffer, wlen, format, &rect, brush,
+                    m_drawTextOptions);
+            }
+            cellX += static_cast<float>(cl.cells) * m_charWidthDips;
+            i = static_cast<uint16_t>(i + cl.bytes);
+        }
+    }
 
     if (flags & 0x04)
     {
@@ -519,7 +834,8 @@ void Renderer::RewrapAll()
     for (uint32_t i = 0; i < count; ++i)
     {
         const LineView line = m_ringBuffer.Get(i);
-        const uint16_t rows = ComputeWrapRows(line.text, line.length, cols, contCols,
+        const uint16_t rows = ComputeWrapRows(line.text, line.length,
+            !(line.flags & LineFlagNonAscii), cols, contCols,
             nullptr, IrcLineTextSize);
         m_ringBuffer.SetRowCount(i, rows);
         m_totalRows += rows;
@@ -542,7 +858,8 @@ void Renderer::ProcessInputQueue()
         scratch.length = 0;
         scratch.segmentCount = 0; // Parse appends from these; text needs no reset
         IrcParser::Parse(&scratch, buffer, length, m_fgColor, m_bgColor);
-        scratch.rowCount = ComputeWrapRows(scratch.text, scratch.length, cols, contCols,
+        scratch.rowCount = ComputeWrapRows(scratch.text, scratch.length,
+            !(scratch.flags & LineFlagNonAscii), cols, contCols,
             nullptr, IrcLineTextSize);
         m_totalRows -= m_ringBuffer.Append(scratch); // rows of any evicted lines
         m_totalRows += scratch.rowCount;
@@ -575,6 +892,20 @@ FrameResult Renderer::RenderFrame()
     result.dirtyW = m_width;
     result.dirtyH = m_height;
     result.rendered = false;
+
+    // Deferred font change: must precede ProcessInputQueue, whose wrap math
+    // reads m_charWidthDips.
+    if (m_fontDirty && m_dwriteFactory)
+    {
+        m_fontDirty = false;
+        for (auto& f : m_textFormats)
+            SafeRelease(f);
+        SafeRelease(m_fontFace);
+        ClearClusterCache();  // cached layouts bake the old font's metrics
+        BuildFontResources(); // best-effort: a failure leaves formats null,
+                              // which DrawSegment/MeasureSegment handle
+        RewrapAll();          // column width may have changed
+    }
 
     ProcessInputQueue();
 
@@ -625,9 +956,10 @@ FrameResult Renderer::RenderFrame()
     for (; li < count && y < m_viewHeightDips; ++li)
     {
         const LineView slot = m_ringBuffer.Get(li);
+        const bool ascii = !(slot.flags & LineFlagNonAscii);
 
-        const uint16_t rows = ComputeWrapRows(slot.text, slot.length, cols, contCols,
-            rowStarts, IrcLineTextSize);
+        const uint16_t rows = ComputeWrapRows(slot.text, slot.length, ascii,
+            cols, contCols, rowStarts, IrcLineTextSize);
 
         for (uint16_t r = static_cast<uint16_t>(rowInLine);
              r < rows && y < m_viewHeightDips; ++r, y += m_lineHeight)
@@ -641,7 +973,7 @@ FrameResult Renderer::RenderFrame()
             {
                 // No segments parsed: draw as plain text (no bg fill, width unused)
                 DrawSegment(slot.text + rowStart, rowEnd - rowStart, x, y, 0.0f,
-                    IrcPalette::Default, IrcPalette::Default, 0);
+                    IrcPalette::Default, IrcPalette::Default, 0, ascii);
             }
             else
             {
@@ -659,11 +991,13 @@ FrameResult Renderer::RenderFrame()
                     if (runEnd <= runStart)
                         continue;
 
-                    // Monospace: advance and bg-fill width are column arithmetic,
-                    // no per-frame DWrite measurement.
-                    const float runWidth = static_cast<float>(runEnd - runStart) * m_charWidthDips;
+                    // Monospace grid: advance and bg-fill width are cell
+                    // arithmetic, no per-frame DWrite measurement.
+                    const float runWidth = ascii
+                        ? static_cast<float>(runEnd - runStart) * m_charWidthDips
+                        : static_cast<float>(TextCells::CountCells(slot.text, runStart, runEnd)) * m_charWidthDips;
                     DrawSegment(slot.text + runStart, runEnd - runStart, x, y,
-                        runWidth, seg.fg, seg.bg, seg.flags);
+                        runWidth, seg.fg, seg.bg, seg.flags, ascii);
                     x += runWidth;
                 }
             }
@@ -686,16 +1020,23 @@ FrameResult Renderer::RenderFrame()
                     }
                     if (he >= hs)
                     {
-                        float hw = static_cast<float>(he - hs) * m_charWidthDips;
+                        // Cell math: HitTest snaps hs/he to cluster starts,
+                        // so both counts land on cluster boundaries.
+                        float hw = ascii
+                            ? static_cast<float>(he - hs) * m_charWidthDips
+                            : static_cast<float>(TextCells::CountCells(slot.text, hs, he)) * m_charWidthDips;
                         // A blank line inside a multi-line selection still
                         // shows a one-cell stub so it reads as selected.
                         if (hw <= 0.0f && selStartLine != selEndLine)
                             hw = m_charWidthDips;
                         if (hw > 0.0f)
                         {
+                            const float hcells = ascii
+                                ? static_cast<float>(hs - rowStart)
+                                : static_cast<float>(TextCells::CountCells(slot.text, rowStart, hs));
                             const float hx = LeftPadDips +
                                 (r > 0 ? static_cast<float>(ContinuationIndentChars) * m_charWidthDips : 0.0f) +
-                                static_cast<float>(hs - rowStart) * m_charWidthDips;
+                                hcells * m_charWidthDips;
                             const D2D1_RECT_F rect = { hx, y, hx + hw, y + m_lineHeight };
                             m_renderTarget->FillRectangle(&rect, m_selectionBrush);
                         }
@@ -746,10 +1087,13 @@ void Renderer::SetSize(int width, int height, float dpiScale)
     m_viewWidthDips = static_cast<float>(width) / m_dpiScale;
     m_viewHeightDips = static_cast<float>(height) / m_dpiScale;
 
+    if (dpiChanged)
+        ClearClusterCache(); // atlas bitmaps bake the pixel density
+
     if (pixelsChanged && m_swapChain)
     {
-        // ResizeBuffers requires every back-buffer reference to be gone first.
-        // Brushes are recreated on demand by EnsureBrushes.
+        // ResizeBuffers requires every back-buffer reference to be gone first;
+        // the device context and brushes persist, only the target rebinds.
         ReleaseBackBufferResources();
         if (SUCCEEDED(m_swapChain->ResizeBuffers(0, static_cast<UINT>(width),
                 static_cast<UINT>(height), DXGI_FORMAT_UNKNOWN, 0)))
@@ -862,9 +1206,10 @@ bool Renderer::HitTest(float xDips, float yDips, uint64_t& lineId, uint16_t& off
     GetColumns(cols, contCols);
 
     const LineView line = m_ringBuffer.Get(li);
+    const bool lineAscii = !(line.flags & LineFlagNonAscii);
     uint16_t rowStarts[IrcLineTextSize + 1];
-    const uint16_t rows = ComputeWrapRows(line.text, line.length, cols, contCols,
-        rowStarts, IrcLineTextSize);
+    const uint16_t rows = ComputeWrapRows(line.text, line.length, lineAscii,
+        cols, contCols, rowStarts, IrcLineTextSize);
 
     uint32_t rowInLine = static_cast<uint32_t>(globalRow) >= rowAcc
         ? static_cast<uint32_t>(globalRow) - rowAcc : 0;
@@ -878,13 +1223,36 @@ bool Renderer::HitTest(float xDips, float yDips, uint64_t& lineId, uint16_t& off
     // midpoint. X in the pad clamps to row start, past the text to row end.
     const float indent = rowInLine > 0
         ? static_cast<float>(ContinuationIndentChars) * m_charWidthDips : 0.0f;
-    int col = static_cast<int>(std::round((xDips - LeftPadDips - indent) / m_charWidthDips));
-    const int rowLen = static_cast<int>(rowEnd) - static_cast<int>(rowStart);
-    if (col < 0) col = 0;
-    if (col > rowLen) col = rowLen;
-
     lineId = m_ringBuffer.EvictedTotal() + li;
-    offset = static_cast<uint16_t>(rowStart + col);
+
+    if (lineAscii)
+    {
+        int col = static_cast<int>(std::round((xDips - LeftPadDips - indent) / m_charWidthDips));
+        const int rowLen = static_cast<int>(rowEnd) - static_cast<int>(rowStart);
+        if (col < 0) col = 0;
+        if (col > rowLen) col = rowLen;
+        offset = static_cast<uint16_t>(rowStart + col);
+        return true;
+    }
+
+    // Cluster walk: same midpoint rule (identical to round() when every
+    // cluster is one cell), and the offset always lands on a cluster start
+    // so a selection can never split a multi-byte code point.
+    float cellPos = (xDips - LeftPadDips - indent) / m_charWidthDips;
+    if (cellPos < 0.0f)
+        cellPos = 0.0f;
+    float c = 0.0f;
+    uint16_t i = rowStart;
+    while (i < rowEnd)
+    {
+        const TextCells::Cluster cl = TextCells::NextCluster(line.text, i, rowEnd);
+        const float w = cl.cells > 0 ? static_cast<float>(cl.cells) : 1.0f;
+        if (cellPos < c + w * 0.5f)
+            break;
+        c += static_cast<float>(cl.cells);
+        i = static_cast<uint16_t>(i + cl.bytes);
+    }
+    offset = i;
     return true;
 }
 
@@ -1025,15 +1393,56 @@ void Renderer::Clear()
 
 void Renderer::SetBackgroundColor(uint32_t argb)
 {
-    m_bgColor = argb | 0xFF000000u; // opaque swapchain: force alpha
+    argb |= 0xFF000000u; // opaque swapchain: force alpha
+    if (argb == m_bgColor)
+        return;
+    m_bgColor = argb;
     m_dirty = true;
 }
 
 void Renderer::SetForegroundColor(uint32_t argb)
 {
-    m_fgColor = argb | 0xFF000000u;
+    argb |= 0xFF000000u;
+    if (argb == m_fgColor)
+        return;
+    m_fgColor = argb;
     if (m_defaultFgBrush)
         m_defaultFgBrush->SetColor(ColorFromU32(m_fgColor));
+    m_dirty = true;
+}
+
+void Renderer::SetSelectionColor(uint32_t argb)
+{
+    if (argb == m_selectionColor)
+        return;
+    m_selectionColor = argb; // alpha preserved: the tint overlays drawn glyphs
+    if (m_selectionBrush)
+        m_selectionBrush->SetColor(ColorFromU32(m_selectionColor));
+    m_dirty = true;
+}
+
+// Font changes only mark m_fontDirty; the (expensive) format rebuild and
+// full rewrap run once at the top of the next RenderFrame. This coalesces a
+// back-to-back family+size change into a single rebuild, and makes re-applying
+// the current values free. Scroll metrics reflect the old font for at most one
+// frame; the scrollbar syncs per-frame via FrameRendered anyway.
+void Renderer::SetFontFamily(const wchar_t* family)
+{
+    if (!family || !family[0] || m_fontFamily == family)
+        return;
+
+    m_fontFamily = family;
+    m_fontDirty = true;
+    m_dirty = true;
+}
+
+void Renderer::SetFontSize(float size)
+{
+    if (size <= 0.0f || size == m_fontSize)
+        return;
+
+    m_fontSize = size;
+    m_fontDirty = true;
     m_dirty = true;
 }
 
@@ -1115,6 +1524,21 @@ extern "C" __declspec(dllexport) void SetBackgroundColor(Renderer* renderer, uin
 extern "C" __declspec(dllexport) void SetForegroundColor(Renderer* renderer, uint32_t argb)
 {
     if (renderer) renderer->SetForegroundColor(argb);
+}
+
+extern "C" __declspec(dllexport) void SetSelectionColor(Renderer* renderer, uint32_t argb)
+{
+    if (renderer) renderer->SetSelectionColor(argb);
+}
+
+extern "C" __declspec(dllexport) void SetFontFamily(Renderer* renderer, const wchar_t* family)
+{
+    if (renderer) renderer->SetFontFamily(family);
+}
+
+extern "C" __declspec(dllexport) void SetFontSize(Renderer* renderer, float size)
+{
+    if (renderer) renderer->SetFontSize(size);
 }
 
 extern "C" __declspec(dllexport) void Clear(Renderer* renderer)

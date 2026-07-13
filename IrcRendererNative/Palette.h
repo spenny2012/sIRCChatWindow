@@ -11,6 +11,7 @@ namespace IrcPalette
     constexpr uint32_t Default   = 0u;
     constexpr uint32_t DefaultFg = 0xFFF2F2F2u; // keep in sync with the renderer's default fg brush (0.95)
     constexpr uint32_t DefaultBg = 0xFF141414u; // keep in sync with the renderer's clear color (0.08)
+    constexpr uint32_t DefaultSelection = 0x59598CF2u; // translucent blue (0.35,0.55,0.95 @ alpha 0.35)
 
     constexpr uint32_t Pack(uint8_t r, uint8_t g, uint8_t b) noexcept
     {
