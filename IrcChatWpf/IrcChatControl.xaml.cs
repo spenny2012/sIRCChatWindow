@@ -10,10 +10,15 @@ namespace IrcChatWpf
 {
     public partial class IrcChatControl : UserControl
     {
+        private const double DefaultFontSizeDips = 14.0; // mirrors the native/host default
+        private const double MinZoomFontSize = 6.0;
+        private const double MaxZoomFontSize = 72.0;
+
         private IrcSwapchainHost _ircHost;
         private bool _updatingScroll;
         private bool _selecting;
         private double _viewportDips; // cached so MouseMove skips a per-move native call
+        private int _wheelZoomRemainder; // accumulates sub-notch deltas (precision touchpads)
         private Color? _fgColor; // set before the host exists → applied on creation
         private Color? _bgColor;
         private Color? _selectionColor;
@@ -115,6 +120,14 @@ namespace IrcChatWpf
             _ircHost?.SetFontFamily(fontFamily);
         }
 
+        /// <summary>Enables growing/shrinking the font with Ctrl+mouse-wheel
+        /// over the chat area (default true). The size is clamped to
+        /// [6, 72] DIPs; plain wheel scrolling is unaffected.</summary>
+        public bool EnableFontZoom { get; set; } = true;
+
+        /// <summary>The current rendering font size in DIPs.</summary>
+        public double CurrentFontSize => _fontSize ?? DefaultFontSizeDips;
+
         /// <summary>Sets the rendering font size in DIPs. Non-positive values
         /// are ignored. Applies immediately, like <see cref="SetFontFamily"/>.
         /// Safe to call before the control is loaded.</summary>
@@ -199,6 +212,31 @@ namespace IrcChatWpf
         {
             if (_ircHost == null)
                 return;
+
+            if (EnableFontZoom && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+            {
+                // Accumulate so precision touchpads (deltas < 120) still zoom,
+                // and a direction reversal responds immediately instead of
+                // unwinding the leftover from the previous direction.
+                if (Math.Sign(e.Delta) != Math.Sign(_wheelZoomRemainder))
+                    _wheelZoomRemainder = 0;
+                _wheelZoomRemainder += e.Delta;
+                int notches = _wheelZoomRemainder / 120;
+                _wheelZoomRemainder -= notches * 120;
+
+                if (notches != 0)
+                {
+                    double next = Math.Max(MinZoomFontSize,
+                        Math.Min(MaxZoomFontSize, CurrentFontSize + notches));
+                    // Skipping the setter at the clamp limits avoids even the
+                    // native call; the rebuild itself is deferred and coalesced
+                    // to one per frame by the renderer.
+                    if (next != CurrentFontSize)
+                        SetFontSize(next);
+                }
+                e.Handled = true;
+                return;
+            }
 
             var info = _ircHost.GetScrollInfo();
             double lines = SystemParameters.WheelScrollLines;
