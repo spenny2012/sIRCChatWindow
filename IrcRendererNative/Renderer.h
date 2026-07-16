@@ -7,7 +7,11 @@
 
 #include <string>
 
-constexpr uint32_t InputQueueCapacity = 4096;
+// 1024 slots (~540 KB): the per-frame drain is MaxInputBatch (1024) lines, so
+// the queue absorbs a full 50 ms UI-thread stall at a 20k lines/s producer —
+// ~3 frames of headroom at 10x realistic IRC traffic. Overflow drops lines,
+// same as any capacity would under a sustained stall.
+constexpr uint32_t InputQueueCapacity = 1024;
 
 struct FrameResult
 {
