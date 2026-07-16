@@ -16,6 +16,10 @@
          InvariantGlobalization if this grows into a full client. -->
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Nothing here emits EventSource events or HTTP telemetry; skipping
+         their runtime initialization trims a little startup and working set. -->
+    <EventSourceSupport>false</EventSourceSupport>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
   </PropertyGroup>
 
   <PropertyGroup>

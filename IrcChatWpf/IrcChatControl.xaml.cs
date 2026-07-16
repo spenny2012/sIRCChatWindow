@@ -13,6 +13,7 @@ namespace IrcChatWpf
         private IrcSwapchainHost _ircHost;
         private bool _updatingScroll;
         private bool _selecting;
+        private double _viewportDips; // cached so MouseMove skips a per-move native call
         private Color? _fgColor; // set before the host exists → applied on creation
         private Color? _bgColor;
         private Color? _selectionColor;
@@ -245,6 +246,7 @@ namespace IrcChatWpf
             // The host element sits exactly on the viewport (inside the 1 px
             // border), so its DIP coordinates are the renderer's viewport DIPs.
             var p = e.GetPosition(_ircHost);
+            _viewportDips = _ircHost.GetScrollInfo().Viewport;
             _ircHost.SelectionBegin(p.X, p.Y);
             _selecting = true;
             CaptureMouse();
@@ -259,7 +261,7 @@ namespace IrcChatWpf
             var p = e.GetPosition(_ircHost);
             _ircHost.SelectionUpdate(p.X, p.Y);
 
-            if (p.Y < 0 || p.Y > _ircHost.GetScrollInfo().Viewport)
+            if (p.Y < 0 || p.Y > _viewportDips)
                 _dragScrollTimer.Start();
             else
                 _dragScrollTimer.Stop();
@@ -369,6 +371,7 @@ namespace IrcChatWpf
                 return;
 
             var info = _ircHost.GetScrollInfo();
+            _viewportDips = info.Viewport;
             double maximum = Math.Max(0.0, info.Content - info.Viewport);
             double value = maximum - info.Offset;
 

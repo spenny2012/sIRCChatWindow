@@ -151,6 +151,16 @@ void RingBuffer::Clear() noexcept
     m_count = 0;
     m_writeOffset = 0;
     m_evictedTotal = 0;
+
+    // Return the high-water commit to the OS; EnsureCommitted re-grows on
+    // demand and nothing relies on arena contents surviving a Clear.
+    // (SetMaxLines shrink deliberately doesn't decommit: live records wrap
+    // arbitrarily around the arena, so no contiguous range is reclaimable.)
+    if (m_arena && m_committedBytes)
+    {
+        ::VirtualFree(m_arena, m_committedBytes, MEM_DECOMMIT);
+        m_committedBytes = 0;
+    }
 }
 
 LineView RingBuffer::Get(uint32_t logicalIndex) const noexcept

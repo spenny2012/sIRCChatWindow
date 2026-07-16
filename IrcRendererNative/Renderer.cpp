@@ -828,6 +828,7 @@ void Renderer::RewrapAll()
 {
     int cols = 0, contCols = 0;
     GetColumns(cols, contCols);
+    m_lastWrapCols = cols;
 
     m_totalRows = 0;
     const uint32_t count = m_ringBuffer.Count();
@@ -898,6 +899,7 @@ FrameResult Renderer::RenderFrame()
     if (m_fontDirty && m_dwriteFactory)
     {
         m_fontDirty = false;
+        m_wrapDirty = false;  // RewrapAll below covers any pending resize
         for (auto& f : m_textFormats)
             SafeRelease(f);
         SafeRelease(m_fontFace);
@@ -905,6 +907,21 @@ FrameResult Renderer::RenderFrame()
         BuildFontResources(); // best-effort: a failure leaves formats null,
                               // which DrawSegment/MeasureSegment handle
         RewrapAll();          // column width may have changed
+    }
+    else if (m_wrapDirty)
+    {
+        // Deferred from SetSize: coalesces the layout passes of a resize drag
+        // into one rewrap per frame, and skips entirely when the column count
+        // is back where the row counts were computed (vertical-only resize,
+        // or A->B->A width churn within a frame).
+        m_wrapDirty = false;
+        int cols = 0, contCols = 0;
+        GetColumns(cols, contCols);
+        if (cols != m_lastWrapCols)
+        {
+            RewrapAll();
+            ClampScroll();
+        }
     }
 
     ProcessInputQueue();
@@ -1075,9 +1092,6 @@ void Renderer::SetSize(int width, int height, float dpiScale)
     if (width == m_width && height == m_height && dpiScale == m_dpiScale)
         return;
 
-    int oldCols = 0, oldContCols = 0;
-    GetColumns(oldCols, oldContCols);
-
     const bool pixelsChanged = (width != m_width) || (height != m_height);
     const bool dpiChanged = (dpiScale != m_dpiScale);
 
@@ -1106,10 +1120,11 @@ void Renderer::SetSize(int width, int height, float dpiScale)
         m_renderTarget->SetDpi(96.0f * dpiScale, 96.0f * dpiScale);
     }
 
-    int newCols = 0, newContCols = 0;
-    GetColumns(newCols, newContCols);
-    if (newCols != oldCols)
-        RewrapAll(); // row counts and total content height depend on the column width
+    // Row counts and total content height depend on the column width, but the
+    // rewrap is deferred to the top of the next RenderFrame so a resize drag
+    // pays for at most one full-buffer rewrap per frame. Scroll info reads the
+    // old totals for <=1 frame; the dirty frame below resyncs the scrollbar.
+    m_wrapDirty = true;
 
     ClampScroll();
     m_dirty = true;

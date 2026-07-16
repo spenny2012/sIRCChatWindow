@@ -154,9 +154,11 @@ private:
     IDWriteTextFormat*      m_textFormats[4] = {}; // bit 0 bold, bit 1 italic
     IDWriteFontFace*        m_fontFace = nullptr;
 
-    // Cluster atlas cache: direct-mapped, ~8 KB table + <=128 small device
+    // Cluster atlas cache: direct-mapped, ~32 KB table + <=512 small device
     // bitmaps (~2 KB each; bounded, typically a handful of distinct emoji).
-    static constexpr uint32_t ClusterCacheSize = 128; // power of 2
+    // 512 slots because fgArgb is in the key: truecolor-tinted cluster spam
+    // collides constantly at 128, degrading to per-frame re-rasterization.
+    static constexpr uint32_t ClusterCacheSize = 512; // power of 2
     static constexpr uint16_t ClusterKeyMaxLen = 24;  // UTF-16 units; longer bypasses
     struct ClusterEntry
     {
@@ -200,6 +202,8 @@ private:
     bool                    m_autoScroll = true;
     bool                    m_dirty = true;
     bool                    m_fontDirty = false; // rebuild formats/rewrap next frame
+    bool                    m_wrapDirty = false; // re-check columns next frame; rewrap if changed
+    int                     m_lastWrapCols = 0;  // columns the row counts were computed at
 
     // Selection (drag in progress). Endpoints are absolute line ids
     // (RingBuffer::EvictedTotal() + logicalIndex) so they survive eviction,

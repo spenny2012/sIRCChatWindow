@@ -16,10 +16,13 @@ namespace IrcChatWpf
         private readonly Stopwatch _stopwatch = new Stopwatch();
         private readonly Random _random = new Random();
         private readonly StringBuilder _sb = new StringBuilder(512);
+        private readonly Action _updateStatsAction;
+
         public MainWindow()
         {
             InitializeComponent();
             Closed += OnClosed;
+            _updateStatsAction = UpdateStats;
         }
 
         private void OnClosed(object sender, EventArgs e)
@@ -254,7 +257,7 @@ namespace IrcChatWpf
 
                 if (linesGenerated % 100 == 0)
                 {
-                    Dispatcher.BeginInvoke(new Action(UpdateStats));
+                    Dispatcher.BeginInvoke(_updateStatsAction);
                 }
             }
         }
