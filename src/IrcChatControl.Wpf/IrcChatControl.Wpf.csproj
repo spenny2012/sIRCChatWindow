@@ -14,7 +14,7 @@
 
   <PropertyGroup>
     <PackageId>IrcChatControl.Wpf</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>spenny2012</Authors>
     <Description>High-throughput, console-style IRC chat control for WPF. Native Direct2D/DirectWrite renderer on a D3D11 flip-model swapchain hosted via HwndHost; lock-free MPSC input queue and fixed ring buffer sustain thousands of lines/sec with mIRC and ANSI color formatting. Windows x64 only.</Description>
     <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
