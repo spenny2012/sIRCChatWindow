@@ -13,6 +13,22 @@
     <NativeDllPath>$(MSBuildThisFileDirectory)..\..\build\$(Configuration)\IrcRendererNative.dll</NativeDllPath>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <PackageId>IrcChatControl.Wpf</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>spenny2012</Authors>
+    <Description>High-throughput, console-style IRC chat control for WPF. Native Direct2D/DirectWrite renderer on a D3D11 flip-model swapchain hosted via HwndHost; lock-free MPSC input queue and fixed ring buffer sustain thousands of lines/sec with mIRC and ANSI color formatting. Windows x64 only.</Description>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/spenny2012/sIRCChatWindow</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/spenny2012/sIRCChatWindow</PackageProjectUrl>
+    <PackageTags>wpf;irc;chat;terminal;console;direct2d;directwrite;d3d11;native;x64</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
   <!-- The native renderer rides along both as a build output (copies transitively to
        any project that references this one) and as a NuGet runtime asset. -->
   <ItemGroup Condition="Exists('$(NativeDllPath)')">
@@ -24,6 +40,12 @@
   <Target Name="WarnMissingNativeRenderer" BeforeTargets="Build"
           Condition="!Exists('$(NativeDllPath)')">
     <Warning Text="IrcRendererNative.dll not found at $(NativeDllPath). Build src\IrcRendererNative (Platform=x64, Configuration=$(Configuration)) first; the control will fail at runtime without it." />
+  </Target>
+
+  <!-- Never produce a package that would fail at runtime. -->
+  <Target Name="ErrorIfNativeMissingOnPack" BeforeTargets="GenerateNuspec"
+          Condition="!Exists('$(NativeDllPath)')">
+    <Error Text="Refusing to pack without build\$(Configuration)\IrcRendererNative.dll — build src\IrcRendererNative (Platform=x64) first." />
   </Target>
 
 </Project>
