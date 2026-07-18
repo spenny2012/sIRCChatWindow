@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build native renderer (Release x64)
+        run: msbuild src\IrcRendererNative\IrcRendererNative.vcxproj -p:Configuration=Release -p:Platform=x64 -v:minimal -nologo
+
+      - name: Build demo (sanity + transitive native copy)
+        run: dotnet build demo\IrcChatWpf\IrcChatWpf.csproj -c Release -p:Platform=x64
+
+      - name: Assert native DLL reached demo output
+        run: |
+          if (-not (Test-Path 'demo\IrcChatWpf\bin\x64\Release\net8.0-windows\win-x64\IrcRendererNative.dll')) {
+            Write-Error 'IrcRendererNative.dll missing from demo output - transitive copy broke'
+            exit 1
+          }
+
+      - name: Compute version
+        id: ver
+        run: |
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { "0.0.0-ci.$env:GITHUB_RUN_NUMBER" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Pack
+        run: dotnet pack src\IrcChatControl.Wpf\IrcChatControl.Wpf.csproj -c Release -o artifacts -p:Version=${{ steps.ver.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts
+
+      - name: Push to NuGet.org
+        run: dotnet nuget push artifacts\*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+
+      - name: Attach nupkg to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.nupkg
