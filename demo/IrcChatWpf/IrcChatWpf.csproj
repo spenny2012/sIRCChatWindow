@@ -25,7 +25,7 @@
   <ItemGroup>
     <!-- IrcRendererNative.dll flows to this project's output through the
          library's CopyToOutputDirectory item. -->
-    <ProjectReference Include="..\src\IrcChatControl.Wpf\IrcChatControl.Wpf.csproj" />
+    <ProjectReference Include="..\..\src\IrcChatControl.Wpf\IrcChatControl.Wpf.csproj" />
   </ItemGroup>
 
 </Project>
