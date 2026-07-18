@@ -1,159 +1,138 @@
-# High-Performance Native IRC Chat Control for WPF
+# IrcChatControl.Wpf
 
-A console-style chat control that bypasses WPF's retained-mode text stack by rendering IRC content in a native C++ DLL with Direct2D / DirectWrite, hosted inside a WPF `D3DImage` via a shared DirectX surface.
+A high-throughput, console-style IRC chat control for WPF. Text is rendered by a native C++ DLL with Direct2D / DirectWrite into a D3D11 flip-model swapchain on a child HWND (hosted via `HwndHost`), bypassing WPF's retained-mode text stack entirely. A lock-free MPSC input queue and a fixed pre-allocated ring buffer let producer threads push thousands of lines per second without blocking the UI.
 
-## Goals Met
+- **Throughput:** 1,000–5,000+ lines/sec sustained; `AddLine` is thread-safe and allocation-free on the hot path.
+- **Scrollback:** 50,000-line pre-allocated ring buffer (configurable cap at runtime via `SetMaxLines`).
+- **Formatting:** mIRC control codes (bold, italic, underline, colors incl. extended range) and ANSI SGR escape sequences (`ESC[...m`, incl. 38/48 extended colors).
+- **Unicode:** full UTF-8 pipeline with emoji (color font) and CJK wide-cell support.
+- **Interaction:** pixel-smooth wheel scrolling, PageUp/PageDown/Home/End, live scrollbar scrubbing, drag selection with clipboard copy, Ctrl+wheel font zoom.
+- **Idle cost:** the render timer parks when nothing changes — 0% CPU at idle.
 
-- **Throughput:** lock-free MPSC input queue + fixed-size ring buffer allow the producer thread to push 1,000–5,000+ lines/sec without blocking the render or UI threads.
-- **Scrollback:** 50,000-line pre-allocated ring buffer (no heap allocations on the hot path).
-- **Frame time:** only visible lines are drawn; a 60 FPS `DispatcherTimer` drives invalidation.
-- **Memory:** ring buffer is ~32 MB fixed cost regardless of churn.
-- **No WPF text objects:** `FlowDocument`, `Run`, `Span`, etc. are not used for chat content.
+## Requirements
 
-## Solution Layout
+- Windows 10/11, **x64 only** (see note below)
+- .NET 8 (`net8.0-windows`)
+- No VC++ redistributable needed — the native renderer links the CRT statically
+
+> **x64 note:** the native renderer ships only as a `win-x64` binary. Set `<PlatformTarget>x64</PlatformTarget>` in your app project. On Windows ARM64 an AnyCPU .NET 8 app runs as a native arm64 process and *will not* load the x64 DLL (`win-arm64` does not fall back to `win-x64` in the RID graph); forcing `PlatformTarget=x64` makes the app run under x64 emulation instead, which works.
+
+## Install (NuGet)
 
 ```
-IrcChat.sln
-├── IrcRendererNative/          C++ native DLL
-│   ├── RingBuffer.h/cpp        Fixed-capacity LineSlot ring buffer
-│   ├── MpscQueue.h             Lock-free multi-producer / single-consumer queue
-│   ├── IrcParser.h/cpp         Inline mIRC control-code parser
-│   ├── Renderer.h/cpp          D3D11 shared texture, D2D/DWrite renderer, C exports
-│   └── Exports.cpp             Export forwarding
-└── IrcChatWpf/                 .NET 8 WPF test application
-    ├── NativeMethods.cs        P/Invoke + D3D9Ex COM interop
-    ├── IrcD3DImage.cs          D3DImage-derived host
-    ├── IrcChatControl.xaml/.cs WPF wrapper + scrollbar
-    └── MainWindow.xaml/.cs     High-throughput spam test harness
+dotnet add package IrcChatControl.Wpf
 ```
 
-## Build Dependencies
+XAML:
 
-- Windows 10/11 64-bit
-- Visual Studio 2022 with the **Desktop development with C++** workload
-- **Windows 10/11 SDK** (10.0 or later)
-- **.NET 8 SDK**
-- VC++ redistributable matching the VS toolset (v143 / VC17) when running on another machine
-
-## Build Instructions
-
-1. Open `IrcChat.sln` in Visual Studio 2022.
-2. Select **Release | x64**.
-3. Build `IrcRendererNative` first. The DLL is written to `build\Release\IrcRendererNative.dll`.
-4. Build `IrcChatWpf`. The project copies `IrcRendererNative.dll` to its output directory.
-5. Run `IrcChatWpf.exe`.
-
-Or from the command line:
-
-```powershell
-# Build the native DLL
-msbuild IrcChat.sln -p:Configuration=Release -p:Platform=x64 -t:IrcRendererNative
-
-# Build the WPF app
-dotnet build IrcChatWpf\IrcChatWpf.csproj -c Release -p:Platform=x64
+```xml
+<Window ...
+        xmlns:chat="clr-namespace:IrcChatWpf;assembly=IrcChatControl.Wpf">
+    <chat:IrcChatControl x:Name="Chat" />
+</Window>
 ```
 
-## Test Harness
+Code:
 
-The main window contains:
-
-- **Start Spam** – launches a background thread that injects random IRC-formatted lines at the configured rate.
-- **Rate** – target lines per second (default 2,000).
-- **Stop Spam** – stops the producer thread.
-- **Clear** – empties the native ring buffer.
-
-Interact with the chat:
-
-- **Mouse wheel** – pixel-smooth scrolling; honors the OS "lines per notch" setting and high-resolution wheel deltas.
-- **Page Up / Page Down** – scroll by one viewport.
-- **Home / End** – jump to the oldest / newest line.
-- **ScrollBar** – operates in pixel (DIP) units against the native content extent; dragging the thumb scrubs live.
-
-## Native C Export Contract
-
-`IrcRendererNative.dll` exposes plain C-style exports:
-
-```c
-Renderer* CreateRenderer(int widthPx, int heightPx, float dpiScale,
-                         int surfaceWidthPx, int surfaceHeightPx);
-void      DestroyRenderer(Renderer* renderer);
-bool      AddLine(Renderer* renderer, const char* text, int length);
-bool      RenderFrame(Renderer* renderer, int* dirtyX, int* dirtyY, int* dirtyW, int* dirtyH);
-HANDLE    GetSharedHandle(Renderer* renderer);
-void      SetSize(Renderer* renderer, int widthPx, int heightPx, float dpiScale);   // viewport only, no realloc
-bool      ResizeSurface(Renderer* renderer, int surfaceWidthPx, int surfaceHeightPx); // grow-only, rebind back buffer after
-void      ScrollByPixels(Renderer* renderer, float deltaDips);   // + = up / into history
-void      ScrollToOffset(Renderer* renderer, float offsetDips);  // absolute distance from bottom, clamped
-void      ScrollToEnd(Renderer* renderer);
-void      Clear(Renderer* renderer);
-int       GetLineCount(Renderer* renderer);
-void      GetChatScrollInfo(Renderer* renderer, float* contentHeight, float* viewportHeight,
-                            float* scrollOffset, float* lineHeight, int* pinned);
+```csharp
+Chat.AddLine("\x0304Hello \x02world\x02 — colors, bold, ANSI \x1b[32mgreen\x1b[0m");
 ```
 
-Surface dimensions are device pixels; all scroll/layout values are DIPs. The scroll
-offset is the distance from the bottom of content to the bottom of the viewport
-(`0` = pinned to the newest line, auto-scroll engaged). While scrolled up, appended
-lines grow the offset so the visible text stays stationary.
+## Use as a git submodule
 
-All calls are single-threaded except `AddLine`, which is thread-safe via the lock-free MPSC queue.
+```
+git submodule add https://github.com/spenny2012/sIRCChatWindow.git external/sIRCChatWindow
+```
 
-## Architecture Notes
+1. Add `src/IrcRendererNative/IrcRendererNative.vcxproj` and `src/IrcChatControl.Wpf/IrcChatControl.Wpf.csproj` to your solution (the native project needs the VS "Desktop development with C++" workload + Windows 10/11 SDK).
+2. Set a solution build dependency: **IrcChatControl.Wpf → IrcRendererNative** (the native DLL must exist before the library builds; you'll get a clear build warning if it doesn't).
+3. Reference `IrcChatControl.Wpf` from your app with a `ProjectReference`. The native DLL flows to your output automatically.
 
-### Zero-Allocation Hot Path
+The native project always writes to `<submodule>/build/<Configuration>/` regardless of where your solution lives, and the library looks it up there — no path wiring needed.
 
-- `AddLine` copies UTF-8 bytes into a lock-free circular queue (`MpscQueue`) using only atomic operations.
-- The render thread dequeues lines during `RenderFrame` and parses them directly into the next `LineSlot` of the pre-allocated ring buffer.
-- No `std::string`, `std::vector`, or exceptions are used in the network/render hot paths.
+## API
 
-### Ring Buffer
+| Member | Description |
+|--------|-------------|
+| `AddLine(string text)` | Append a line (thread-safe, lock-free). mIRC + ANSI codes parsed inline. |
+| `Clear()` | Empty the scrollback (also decommits the arena). |
+| `LineCount` | Lines currently held in the ring buffer. |
+| `SetMaxLines(int)` | Cap the scrollback line count at runtime. |
+| `SetBackgroundColor(Color)` / `SetForegroundColor(Color)` / `SetSelectionColor(Color)` | Theme the control. |
+| `SetFontFamily(string)` / `SetFontSize(double)` | Font control (default Consolas 14). |
+| `EnableFontZoom` | Enable/disable Ctrl+wheel zoom (default on, clamped 6–72 pt). |
+| `CurrentFontSize` | The effective font size after zooming. |
 
-- Capacity: 50,000 lines (`IrcLineCapacity` in `RingBuffer.h`).
-- Each slot holds 512 bytes of text + 16 formatting segments + metadata.
-- When full, the oldest slot is overwritten; `head`, `tail`, and `count` are atomic.
+Keyboard scrolling (PageUp/PageDown/Home/End) activates after the control has been clicked (it takes focus on mouse-down).
 
-### Rendering
-
-- Native side creates a D3D11 BGRA render-target texture with `D3D11_RESOURCE_MISC_SHARED`.
-- WPF creates a D3D9Ex device and opens the shared texture by handle for `D3DImage.SetBackBuffer`.
-- Direct2D renders into the D3D11 texture; DirectWrite draws each colored segment with a cached `IDWriteTextFormat`.
-- Only the visible viewport is rendered (from the first visible row until `y` passes the viewport height, with sub-line pixel offsets for smooth scrolling).
-- Long lines word-wrap at spaces onto continuation rows with a 2-character hanging indent. Wrapping is column arithmetic (exact for the monospace font): each slot caches its wrapped row count, the renderer keeps a running total for scroll extent, and a resize re-wraps all slots in one O(total chars) pass.
-- The surface chain is allocated once at screen size; the renderer draws into the top-left viewport region and WPF shows it 1:1 (`Stretch="None"` + clip). Interactive resizes therefore reflow live without reallocating GPU resources or scaling glyphs; the surface only grows (via `ResizeSurface`) if the viewport outgrows it, e.g. moving to a larger monitor.
-- After `EndDraw`, the renderer flushes the D3D11 context and waits on an event query before returning. Without this, WPF's D3D9 side copies the shared surface while the frame is still executing on the GPU, which shows up as a half-drawn frame: text at the top, blank clear color at the bottom.
-
-### Formatting
-
-mIRC control codes parsed inline:
+### Formatting codes
 
 | Code | Meaning |
 |------|---------|
 | `\x02` | Toggle bold |
-| `\x03` | Foreground color, optional `,background` (0–15) |
+| `\x03` | mIRC foreground color, optional `,background` |
 | `\x0F` | Reset all formatting |
 | `\x1F` | Toggle underline |
 | `\x16` | Toggle italic |
+| `\x1B[...m` | ANSI SGR: styles, 16/256/truecolor via 38/48 |
 
-## Tuning
+## Building from source
+
+```powershell
+# 1. Native renderer (needs VS 2022 C++ workload + Windows SDK)
+msbuild src\IrcRendererNative\IrcRendererNative.vcxproj -p:Configuration=Release -p:Platform=x64
+
+# 2. Demo app (also builds the library)
+dotnet build demo\IrcChatWpf\IrcChatWpf.csproj -c Release -p:Platform=x64
+
+# Run the spam-test harness
+demo\IrcChatWpf\bin\x64\Release\net8.0-windows\win-x64\IrcChatWpf.exe
+```
+
+Or open `IrcChat.sln` in Visual Studio 2022 (Release | x64) — build order is wired in the solution.
+
+The demo harness generates random formatted lines at a configurable rate (default 2,000/sec) with buttons for theming, font cycling, scrollback capping, and a test pattern.
+
+## Architecture
+
+```
+IrcChat.sln
+├── src/IrcRendererNative/       C++ native DLL (Direct2D/DirectWrite/D3D11)
+│   ├── RingBuffer.h/cpp         Fixed-capacity line ring buffer (arena-backed)
+│   ├── MpscQueue.h              Lock-free multi-producer/single-consumer queue
+│   ├── IrcParser.h/cpp          Inline mIRC + ANSI SGR parser
+│   ├── TextCells.h              Emoji/CJK cell model
+│   └── Renderer.h/cpp           Flip-model swapchain, D2D/DWrite rendering
+├── src/IrcChatControl.Wpf/      .NET 8 WPF class library (the NuGet package)
+│   ├── NativeMethods.cs         P/Invoke layer
+│   ├── IrcSwapchainHost.cs      HwndHost hosting the renderer's child HWND
+│   └── IrcChatControl.xaml/.cs  Public UserControl + scrollbar/input handling
+└── demo/IrcChatWpf/             Spam-test harness (WinExe)
+```
+
+- `AddLine` UTF-8-encodes straight into the lock-free queue; the render pass drains it into pre-allocated ring-buffer slots — no `std::string`, no heap allocation, no exceptions on the hot path.
+- Only visible lines are drawn. A ~60 Hz `DispatcherTimer` drives frames and **parks itself when idle** (a wake protocol on the producer side restarts it), so an idle window costs zero CPU.
+- Word-wrap is column arithmetic against the monospace grid; each slot caches its wrapped row count and resizes re-wrap in one pass (deferred while zooming).
+- Rendering goes to a DXGI flip-model swapchain on a child HWND — no D3D9 interop, no `D3DImage`, no per-frame GPU copies through WPF.
+
+## Host-app memory tuning (optional)
+
+The demo's [`App.xaml.cs`](demo/IrcChatWpf/App.xaml.cs) shows two optional, app-level optimizations that meaningfully shrink a chat-centric app's footprint; both are choices for *your* application, not behavior of the control:
+
+- `RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly` — keeps WPF itself off the GPU. The chat surface has its own swapchain, so WPF hardware acceleration would only composite chrome, at the cost of a D3D9Ex device and vendor driver stack (~tens of MB). Set it before the first window is created; skip it if your app has GPU-heavy WPF UI of its own.
+- A settle-then-trim pattern (aggressive Gen2 collect + `SetProcessWorkingSetSize` once at startup and again after activity bursts go quiet) — startup XAML parsing and message floods leave garbage in committed GC regions that steady state never touches.
+
+## Tuning constants
 
 | Constant | Location | Effect |
 |----------|----------|--------|
-| `IrcLineCapacity` | `RingBuffer.h` | Scrollback line count. Changing it scales the fixed memory cost linearly. |
-| `IrcLineTextSize` | `RingBuffer.h` | Maximum bytes per line. |
-| `IrcMaxSegments` | `RingBuffer.h` | Maximum color/format runs per line. |
-| `InputQueueCapacity` | `Renderer.h` | Lock-free queue depth for bursty producers. Must be a power of two. |
-| `MaxInputBatch` | `Renderer.cpp` | Lines drained from the queue per frame. Increase for > ~15k lines/sec. |
-| Timer interval | `IrcD3DImage.cs` | Default 16 ms (~60 FPS). Lower for lower latency, raise to reduce CPU. |
-| `ContinuationIndentChars` | `Renderer.cpp` | Indent (in characters) for wrapped continuation rows. |
-| `FontSize` / `FontFamily` | `Renderer.cpp` | Default Consolas 14 pt. |
-
-## Known Limitations / Future Work
-
-- **Dirty rectangles** currently mark the full surface each frame. New-line-only and scroll-bit-blit optimizations are straightforward additions.
-- **Unicode:** text is currently treated as byte-per-character for rendering. Full UTF-8 support would store UTF-16 segment offsets and use `DrawText` with UTF-16 buffers.
-- **Text selection / copy:** not implemented; would require hit-testing against segment metrics.
-- **Underline / italic rendering:** uses separate cached `IDWriteTextFormat` objects; no per-line `IDWriteTextLayout` is created.
+| `IrcLineCapacity` | `RingBuffer.h` | Compile-time scrollback capacity (50,000). |
+| `IrcLineTextSize` | `RingBuffer.h` | Max bytes per line (512). |
+| `IrcMaxSegments` | `RingBuffer.h` | Max color/format runs per line (16). |
+| `InputQueueCapacity` | `Renderer.h` | Lock-free queue depth (power of two). |
+| `MaxInputBatch` | `Renderer.cpp` | Lines drained per frame; raise for >15k lines/sec. |
+| Timer interval | `IrcSwapchainHost.cs` | ~16 ms (60 FPS); parks at idle. |
 
 ## License
 
-This is a reference / starting-point implementation provided as-is for integration into a larger application.
+GPL-3.0-or-later — see [LICENSE](LICENSE). Note the copyleft implication: if you distribute an application that includes this control, the GPL's terms apply to that distribution. (© the repository owner; other arrangements are possible on request.)
