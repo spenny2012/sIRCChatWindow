@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- Keep the original namespace: class IrcChatControl inside a namespace named
+         IrcChatControl.Wpf would create namespace-vs-type ambiguity for consumers. -->
+    <RootNamespace>IrcChatWpf</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <NativeDllPath>$(MSBuildThisFileDirectory)..\..\build\$(Configuration)\IrcRendererNative.dll</NativeDllPath>
+  </PropertyGroup>
+
+  <!-- The native renderer rides along both as a build output (copies transitively to
+       any project that references this one) and as a NuGet runtime asset. -->
+  <ItemGroup Condition="Exists('$(NativeDllPath)')">
+    <None Include="$(NativeDllPath)" Link="IrcRendererNative.dll"
+          CopyToOutputDirectory="PreserveNewest" Visible="false"
+          Pack="true" PackagePath="runtimes/win-x64/native/" />
+  </ItemGroup>
+
+  <Target Name="WarnMissingNativeRenderer" BeforeTargets="Build"
+          Condition="!Exists('$(NativeDllPath)')">
+    <Warning Text="IrcRendererNative.dll not found at $(NativeDllPath). Build src\IrcRendererNative (Platform=x64, Configuration=$(Configuration)) first; the control will fail at runtime without it." />
+  </Target>
+
+</Project>

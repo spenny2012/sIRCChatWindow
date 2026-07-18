@@ -22,19 +22,10 @@
     <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
   </PropertyGroup>
 
-  <PropertyGroup>
-    <NativeDllPath>$(MSBuildThisFileDirectory)..\build\$(Configuration)\IrcRendererNative.dll</NativeDllPath>
-  </PropertyGroup>
-
-  <!-- Tracked item so Visual Studio's fast up-to-date check re-copies a rebuilt
-       native DLL even when no C# changed. -->
-  <ItemGroup Condition="Exists('$(NativeDllPath)')">
-    <None Include="$(NativeDllPath)" Link="IrcRendererNative.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  <ItemGroup>
+    <!-- IrcRendererNative.dll flows to this project's output through the
+         library's CopyToOutputDirectory item. -->
+    <ProjectReference Include="..\src\IrcChatControl.Wpf\IrcChatControl.Wpf.csproj" />
   </ItemGroup>
-
-  <Target Name="CopyNativeDll" AfterTargets="Build">
-    <!-- Copy the native renderer DLL next to the managed executable if it exists. -->
-    <Copy SourceFiles="$(NativeDllPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('$(NativeDllPath)')" />
-  </Target>
 
 </Project>

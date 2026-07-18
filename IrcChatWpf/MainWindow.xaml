@@ -1,7 +1,7 @@
 <Window x:Class="IrcChatWpf.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:IrcChatWpf"
+        xmlns:chat="clr-namespace:IrcChatWpf;assembly=IrcChatControl.Wpf"
         Title="High-Performance IRC Chat"
         Width="1200"
         Height="800"
@@ -27,6 +27,6 @@
             </ToolBar>
         </ToolBarTray>
 
-        <local:IrcChatControl x:Name="ChatControl" Grid.Row="1" />
+        <chat:IrcChatControl x:Name="ChatControl" Grid.Row="1" />
     </Grid>
 </Window>
