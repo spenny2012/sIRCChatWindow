@@ -27,6 +27,15 @@
             </ToolBar>
         </ToolBarTray>
 
-        <chat:IrcChatControl x:Name="ChatControl" Grid.Row="1" />
+        <!-- Proves right-click routes through the hit-test-transparent native
+             child HWND to WPF (hosts hang script popup menus off this). -->
+        <chat:IrcChatControl x:Name="ChatControl" Grid.Row="1">
+            <chat:IrcChatControl.ContextMenu>
+                <ContextMenu>
+                    <MenuItem Header="Scroll to End" Click="OnScrollToEndClick" />
+                    <MenuItem Header="Clear" Click="OnClearClick" />
+                </ContextMenu>
+            </chat:IrcChatControl.ContextMenu>
+        </chat:IrcChatControl>
     </Grid>
 </Window>

@@ -198,6 +198,8 @@ private:
     float                   m_charWidthDips = 8.0f;   // monospace advance width
     float                   m_underlineY = 15.4f;     // underline top, relative to row top
     float                   m_underlineThickness = 1.0f;
+    float                   m_strikeY = 7.7f;         // strikethrough top, relative to row top
+    float                   m_strikeThickness = 1.0f;
     float                   m_baselineY = 11.2f;      // uniform baseline for all DrawText chunks
     // CLIP always; ENABLE_COLOR_FONT OR'd in when the target supports it.
     D2D1_DRAW_TEXT_OPTIONS  m_drawTextOptions = D2D1_DRAW_TEXT_OPTIONS_CLIP;

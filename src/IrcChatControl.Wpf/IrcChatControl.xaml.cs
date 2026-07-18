@@ -8,6 +8,12 @@ using System.Windows.Threading;
 
 namespace IrcChatWpf
 {
+    /// <summary>Console-style IRC chat surface rendered by a native
+    /// Direct2D/DirectWrite renderer. Theme it via the standard WPF
+    /// <see cref="Control.Background"/>, <see cref="Control.Foreground"/>,
+    /// <see cref="Control.FontFamily"/>, and <see cref="Control.FontSize"/>
+    /// properties (bindable; solid brushes reach the renderer) or the
+    /// equivalent Set* methods.</summary>
     public partial class IrcChatControl : UserControl
     {
         private const double DefaultFontSizeDips = 14.0; // mirrors the native/host default
@@ -19,14 +25,30 @@ namespace IrcChatWpf
         private bool _selecting;
         private double _viewportDips; // cached so MouseMove skips a per-move native call
         private int _wheelZoomRemainder; // accumulates sub-notch deltas (precision touchpads)
-        private Color? _fgColor; // set before the host exists → applied on creation
-        private Color? _bgColor;
-        private Color? _selectionColor;
-        private string _fontFamily; // null = use the native default (Consolas)
-        private double? _fontSize;
-        private int? _maxLines;
+        private int? _maxLines; // set before the host exists → applied on creation
         private readonly DispatcherTimer _dragScrollTimer;
 
+        static IrcChatControl()
+        {
+            // Route the standard theming properties to the native renderer.
+            // Metadata merge keeps the base flags (Inherits on the font
+            // properties), so an ancestor's FontFamily/FontSize cascades in
+            // like any WPF control; the defaults are re-based to the
+            // renderer's own console theme so an unstyled control keeps
+            // Consolas 14 on the dark palette. Callbacks fire only when a
+            // value changes — the AddLine/render hot path never touches DPs.
+            BackgroundProperty.OverrideMetadata(typeof(IrcChatControl),
+                new FrameworkPropertyMetadata(FrozenBrush(Color.FromRgb(0x14, 0x14, 0x14)), OnBackgroundChanged));
+            ForegroundProperty.OverrideMetadata(typeof(IrcChatControl),
+                new FrameworkPropertyMetadata(FrozenBrush(Color.FromRgb(0xF2, 0xF2, 0xF2)), OnForegroundChanged));
+            FontFamilyProperty.OverrideMetadata(typeof(IrcChatControl),
+                new FrameworkPropertyMetadata(new FontFamily("Consolas"), OnFontFamilyChanged));
+            FontSizeProperty.OverrideMetadata(typeof(IrcChatControl),
+                new FrameworkPropertyMetadata(DefaultFontSizeDips, OnFontSizeChanged));
+        }
+
+        /// <summary>Initializes the control. The native rendering surface is
+        /// created when the control is loaded into a window.</summary>
         public IrcChatControl()
         {
             InitializeComponent();
@@ -62,62 +84,81 @@ namespace IrcChatWpf
             }
         }
 
+        /// <summary>Appends one line to the scrollback. Thread-safe,
+        /// lock-free, and allocation-free on the hot path: any thread may call
+        /// this at thousands of lines per second. mIRC control codes and ANSI
+        /// SGR sequences are parsed inline; lines are capped at 512 UTF-8
+        /// bytes. Lines added before the control is loaded are dropped.</summary>
         public void AddLine(string text)
         {
             _ircHost?.AddLine(text);
         }
 
+        /// <summary>Removes every line from the scrollback and decommits the
+        /// backing text arena. UI thread only.</summary>
         public void Clear()
         {
             _ircHost?.Clear();
         }
 
+        /// <summary>Number of lines currently held in the scrollback ring
+        /// buffer (after any eviction by <see cref="SetMaxLines"/>).</summary>
         public int LineCount => _ircHost?.LineCount ?? 0;
 
-        /// <summary>Sets the chat surface's background color. Applies
-        /// immediately to all content (explicit mIRC/ANSI colors are
-        /// unaffected). Safe to call before the control is loaded.</summary>
-        public void SetBackgroundColor(Color color)
+        /// <summary>Scrolls to the newest line and re-pins auto-follow, so
+        /// subsequent <see cref="AddLine"/> calls keep the view at the
+        /// bottom.</summary>
+        public void ScrollToEnd()
         {
-            _bgColor = color;
-            var brush = new SolidColorBrush(color);
-            brush.Freeze(); // frozen brushes skip change-tracking overhead
-            ImageHost.Background = brush;
-            _ircHost?.SetBackgroundColor(PackArgb(color));
+            _ircHost?.ScrollToEnd();
         }
+
+        /// <summary>The tint drawn over selected text during mouse-drag
+        /// selection. The alpha channel is respected (not forced opaque) so
+        /// the tint overlays already-drawn glyphs. Only solid brushes reach
+        /// the renderer.</summary>
+        public static readonly DependencyProperty SelectionBrushProperty =
+            DependencyProperty.Register(nameof(SelectionBrush), typeof(Brush), typeof(IrcChatControl),
+                new FrameworkPropertyMetadata(FrozenBrush(Color.FromArgb(0x59, 0x59, 0x8C, 0xF2)), OnSelectionBrushChanged));
+
+        /// <summary>See <see cref="SelectionBrushProperty"/>.</summary>
+        public Brush SelectionBrush
+        {
+            get => (Brush)GetValue(SelectionBrushProperty);
+            set => SetValue(SelectionBrushProperty, value);
+        }
+
+        /// <summary>Sets the chat surface's background color. Equivalent to
+        /// setting <see cref="Control.Background"/> with a solid brush
+        /// (applies immediately; explicit mIRC/ANSI colors are unaffected).
+        /// Safe to call before the control is loaded.</summary>
+        public void SetBackgroundColor(Color color) =>
+            SetCurrentValue(BackgroundProperty, FrozenBrush(color));
 
         /// <summary>Sets the default text color (text without explicit
-        /// mIRC/ANSI colors). Applies immediately to all content. Safe to
-        /// call before the control is loaded.</summary>
-        public void SetForegroundColor(Color color)
-        {
-            _fgColor = color;
-            _ircHost?.SetForegroundColor(PackArgb(color));
-        }
+        /// mIRC/ANSI colors). Equivalent to setting
+        /// <see cref="Control.Foreground"/> with a solid brush. Safe to call
+        /// before the control is loaded.</summary>
+        public void SetForegroundColor(Color color) =>
+            SetCurrentValue(ForegroundProperty, FrozenBrush(color));
 
-        /// <summary>Sets the tint drawn over selected text during mouse-drag
-        /// selection. Unlike the background/foreground colors, the alpha
-        /// channel is respected (not forced opaque) so the tint can overlay
-        /// already-drawn glyphs. Safe to call before the control is
-        /// loaded.</summary>
-        public void SetSelectionColor(Color color)
-        {
-            _selectionColor = color;
-            _ircHost?.SetSelectionColor(PackArgba(color));
-        }
+        /// <summary>Sets the selection tint; equivalent to setting
+        /// <see cref="SelectionBrush"/> with a solid brush.</summary>
+        public void SetSelectionColor(Color color) =>
+            SetCurrentValue(SelectionBrushProperty, FrozenBrush(color));
 
-        /// <summary>Sets the rendering font family (e.g. "Cascadia Mono").
-        /// Null/empty is ignored. Applies immediately: rebuilds glyph layout
-        /// and re-wraps all scrollback, since word-wrap is column-based on the
-        /// font's monospace advance width. A non-monospace font is allowed but
+        /// <summary>Sets the rendering font family (e.g. "Cascadia Mono");
+        /// equivalent to setting <see cref="Control.FontFamily"/>. Null/empty
+        /// is ignored. Applies immediately: rebuilds glyph layout and re-wraps
+        /// all scrollback, since word-wrap is column-based on the font's
+        /// monospace advance width. A non-monospace font is allowed but
         /// renders with uneven glyph spacing (layout stays fixed-column).
         /// Safe to call before the control is loaded.</summary>
         public void SetFontFamily(string fontFamily)
         {
             if (string.IsNullOrEmpty(fontFamily))
                 return;
-            _fontFamily = fontFamily;
-            _ircHost?.SetFontFamily(fontFamily);
+            SetCurrentValue(FontFamilyProperty, new FontFamily(fontFamily));
         }
 
         /// <summary>Enables growing/shrinking the font with Ctrl+mouse-wheel
@@ -125,18 +166,66 @@ namespace IrcChatWpf
         /// [6, 72] DIPs; plain wheel scrolling is unaffected.</summary>
         public bool EnableFontZoom { get; set; } = true;
 
-        /// <summary>The current rendering font size in DIPs.</summary>
-        public double CurrentFontSize => _fontSize ?? DefaultFontSizeDips;
+        /// <summary>The current rendering font size in DIPs (the
+        /// <see cref="Control.FontSize"/> value, including Ctrl+wheel
+        /// zoom).</summary>
+        public double CurrentFontSize => FontSize;
 
-        /// <summary>Sets the rendering font size in DIPs. Non-positive values
-        /// are ignored. Applies immediately, like <see cref="SetFontFamily"/>.
+        /// <summary>Sets the rendering font size in DIPs; equivalent to
+        /// setting <see cref="Control.FontSize"/>. Non-positive values are
+        /// ignored. Applies immediately, like <see cref="SetFontFamily"/>.
         /// Safe to call before the control is loaded.</summary>
         public void SetFontSize(double size)
         {
             if (size <= 0.0)
                 return;
-            _fontSize = size;
-            _ircHost?.SetFontSize((float)size);
+            SetCurrentValue(FontSizeProperty, size);
+        }
+
+        private static SolidColorBrush FrozenBrush(Color color)
+        {
+            var brush = new SolidColorBrush(color);
+            brush.Freeze(); // frozen brushes skip change-tracking overhead
+            return brush;
+        }
+
+        private static void OnBackgroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var c = (IrcChatControl)d;
+            if (c.ImageHost != null)
+                c.ImageHost.Background = e.NewValue as Brush;
+            if (e.NewValue is SolidColorBrush brush)
+                c._ircHost?.SetBackgroundColor(PackArgb(brush.Color));
+        }
+
+        private static void OnForegroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var c = (IrcChatControl)d;
+            if (e.NewValue is SolidColorBrush brush)
+                c._ircHost?.SetForegroundColor(PackArgb(brush.Color));
+        }
+
+        private static void OnSelectionBrushChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var c = (IrcChatControl)d;
+            if (e.NewValue is SolidColorBrush brush)
+                c._ircHost?.SetSelectionColor(PackArgba(brush.Color));
+        }
+
+        private static void OnFontFamilyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var c = (IrcChatControl)d;
+            string family = (e.NewValue as FontFamily)?.Source;
+            if (!string.IsNullOrEmpty(family))
+                c._ircHost?.SetFontFamily(family);
+        }
+
+        private static void OnFontSizeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var c = (IrcChatControl)d;
+            double size = (double)e.NewValue;
+            if (size > 0.0)
+                c._ircHost?.SetFontSize((float)size);
         }
 
         /// <summary>Sets the scrollback retention limit. Once reached, the
@@ -168,6 +257,8 @@ namespace IrcChatWpf
             RecreateOrResizeSurface();
         }
 
+        /// <summary>Re-derives the native surface's pixel size and DIP metrics
+        /// for the monitor's new DPI scale.</summary>
         protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
         {
             base.OnDpiChanged(oldDpi, newDpi);
@@ -193,11 +284,14 @@ namespace IrcChatWpf
             if (_ircHost == null)
             {
                 _ircHost = new IrcSwapchainHost(px, py, dpi.DpiScaleX);
-                if (_bgColor is Color bg) _ircHost.SetBackgroundColor(PackArgb(bg));
-                if (_fgColor is Color fg) _ircHost.SetForegroundColor(PackArgb(fg));
-                if (_selectionColor is Color sel) _ircHost.SetSelectionColor(PackArgba(sel));
-                if (_fontFamily != null) _ircHost.SetFontFamily(_fontFamily);
-                if (_fontSize is double fs) _ircHost.SetFontSize((float)fs);
+                // DP callbacks fire only on changes, so a fresh host needs the
+                // current values (defaults, styles, or pre-load sets) pushed.
+                if (Background is SolidColorBrush bg) _ircHost.SetBackgroundColor(PackArgb(bg.Color));
+                if (Foreground is SolidColorBrush fg) _ircHost.SetForegroundColor(PackArgb(fg.Color));
+                if (SelectionBrush is SolidColorBrush sel) _ircHost.SetSelectionColor(PackArgba(sel.Color));
+                string family = FontFamily?.Source;
+                if (!string.IsNullOrEmpty(family)) _ircHost.SetFontFamily(family);
+                if (FontSize > 0.0) _ircHost.SetFontSize((float)FontSize);
                 if (_maxLines is int ml) _ircHost.SetMaxLines((uint)ml);
                 _ircHost.FrameRendered += OnFrameRendered;
                 ImageHost.Child = _ircHost;

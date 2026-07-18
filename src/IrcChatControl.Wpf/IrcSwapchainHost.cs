@@ -47,6 +47,14 @@ namespace IrcChatWpf
 
         protected override HandleRef BuildWindowCore(HandleRef hwndParent)
         {
+            // Fail with an actionable message instead of the opaque
+            // BadImageFormat/DllNotFound the loader would produce.
+            if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+                throw new PlatformNotSupportedException(
+                    "IrcChatControl.Wpf requires an x64 process (the native renderer ships as win-x64 only), " +
+                    $"but this process is {RuntimeInformation.ProcessArchitecture}. Set <PlatformTarget>x64</PlatformTarget> " +
+                    "in the host application project; on Windows ARM64 that runs the app under x64 emulation, which is supported.");
+
             _renderer = NativeMethods.CreateRenderer(hwndParent.Handle, _width, _height, (float)_dpiScale);
             if (_renderer == IntPtr.Zero)
                 throw new InvalidOperationException("Failed to create native IRC renderer.");

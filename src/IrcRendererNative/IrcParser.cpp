@@ -14,7 +14,7 @@ namespace
     {
         uint32_t fg = IrcPalette::Default;
         uint32_t bg = IrcPalette::Default;
-        uint8_t  flags = 0;       // bit 0 bold, bit 1 italic, bit 2 underline
+        uint8_t  flags = 0;       // bit 0 bold, bit 1 italic, bit 2 underline, bit 3 strikethrough
         uint8_t  fgBase = 0xFF;   // 0-7 when fg came from SGR 30-37 (bold-brighten tracking)
         bool     reverse = false; // SGR 7/27
     };
@@ -35,6 +35,29 @@ namespace
             value = static_cast<uint8_t>(value * 10 + (text[pos++] - '0'));
         }
         return value;
+    }
+
+    // Parses exactly six hex digits at text[pos] into 0xRRGGBB. Consumes them
+    // only on success, so partial digits stay in the text.
+    inline bool ParseHex6(const char* text, uint16_t& pos, uint16_t length, uint32_t& outRgb) noexcept
+    {
+        if (length - pos < 6)
+            return false;
+
+        uint32_t v = 0;
+        for (int k = 0; k < 6; ++k)
+        {
+            const char c = text[pos + k];
+            uint32_t d;
+            if (c >= '0' && c <= '9')      d = static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') d = static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') d = static_cast<uint32_t>(c - 'A' + 10);
+            else return false;
+            v = (v << 4) | d;
+        }
+        pos = static_cast<uint16_t>(pos + 6);
+        outRgb = v;
+        return true;
     }
 
     inline void FlushSegment(LineSlot* slot, uint16_t start, uint16_t end,
@@ -65,8 +88,8 @@ namespace
     }
 
     // Applies one SGR parameter list (ESC[...m). Indexed loop so 38/48 can
-    // consume their extended-color arguments. Unsupported codes (2, 5, 9,
-    // 21, ...) are ignored by design.
+    // consume their extended-color arguments. Unsupported codes (2, 5, 21,
+    // ...) are ignored by design.
     void ApplySgr(const uint16_t* params, uint8_t count, Style& st) noexcept
     {
         const auto clampByte = [](uint16_t v) noexcept {
@@ -88,12 +111,14 @@ namespace
             case 3:  st.flags |= 0x02; break;
             case 4:  st.flags |= 0x04; break;
             case 7:  st.reverse = true; break;
+            case 9:  st.flags |= 0x08; break;
             case 22:
                 st.flags &= static_cast<uint8_t>(~0x01);
                 if (st.fgBase < 8) st.fg = IrcPalette::Xterm(st.fgBase);
                 break;
             case 23: st.flags &= static_cast<uint8_t>(~0x02); break;
             case 24: st.flags &= static_cast<uint8_t>(~0x04); break;
+            case 29: st.flags &= static_cast<uint8_t>(~0x08); break;
             case 27: st.reverse = false; break;
             case 39: st.fg = IrcPalette::Default; st.fgBase = 0xFF; break;
             case 49: st.bg = IrcPalette::Default; break;
@@ -245,11 +270,36 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
             ++i;
             continue;
         }
-        if (c == '\x16')
+        if (c == '\x1D')
         {
             FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             st.flags ^= 0x02; // toggle italic
             segmentStart = slot->length;
+            ++i;
+            continue;
+        }
+        if (c == '\x16')
+        {
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
+            st.reverse = !st.reverse; // toggle reverse video (same path as SGR 7)
+            segmentStart = slot->length;
+            ++i;
+            continue;
+        }
+        if (c == '\x1E')
+        {
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
+            st.flags ^= 0x08; // toggle strikethrough
+            segmentStart = slot->length;
+            ++i;
+            continue;
+        }
+        if (c == '\x01' || c == '\x11')
+        {
+            // \x01 CTCP delimiter (the host formats ACTION before AddLine),
+            // \x11 monospace toggle (layout is always monospace): stripped.
+            // No style change, so no segment flush — the byte simply isn't
+            // copied into the stored text.
             ++i;
             continue;
         }
@@ -275,7 +325,9 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
             ++i;
             const uint8_t newFg = ParseColor(text, i, length);
             uint8_t newBg = MircIndexDefault;
-            if (i < length && text[i] == ',')
+            // The comma is only part of the code when digits follow;
+            // "\x0305,text" keeps the comma as text.
+            if (i + 1 < length && text[i] == ',' && IsDigit(text[i + 1]))
             {
                 ++i;
                 newBg = ParseColor(text, i, length);
@@ -286,6 +338,37 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
             st.fgBase = 0xFF;
             if (newBg != MircIndexDefault)
                 st.bg = IrcPalette::Mirc(newBg);
+            segmentStart = slot->length;
+            continue;
+        }
+        if (c == '\x04')
+        {
+            FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
+            ++i;
+            uint32_t rgb;
+            if (ParseHex6(text, i, length, rgb))
+            {
+                st.fg = 0xFF000000u | rgb;
+                st.fgBase = 0xFF;
+                // The comma is only consumed when six valid hex digits
+                // follow, mirroring the \x03 comma rule.
+                if (i < length && text[i] == ',')
+                {
+                    uint16_t j = static_cast<uint16_t>(i + 1);
+                    uint32_t bgRgb;
+                    if (ParseHex6(text, j, length, bgRgb))
+                    {
+                        st.bg = 0xFF000000u | bgRgb;
+                        i = j;
+                    }
+                }
+            }
+            else
+            {
+                // Bare \x04 resets fg and leaves bg untouched, like bare \x03.
+                st.fg = IrcPalette::Default;
+                st.fgBase = 0xFF;
+            }
             segmentStart = slot->length;
             continue;
         }

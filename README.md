@@ -4,7 +4,7 @@ A high-throughput, console-style IRC chat control for WPF. Text is rendered by a
 
 - **Throughput:** 1,000–5,000+ lines/sec sustained; `AddLine` is thread-safe and allocation-free on the hot path.
 - **Scrollback:** 50,000-line pre-allocated ring buffer (configurable cap at runtime via `SetMaxLines`).
-- **Formatting:** mIRC control codes (bold, italic, underline, colors incl. extended range) and ANSI SGR escape sequences (`ESC[...m`, incl. 38/48 extended colors).
+- **Formatting:** mIRC control codes (bold, italic, underline, strikethrough, reverse, indexed colors incl. the extended 0–98 range, `\x04` hex colors) and ANSI SGR escape sequences (`ESC[...m`, incl. 38/48 extended colors).
 - **Unicode:** full UTF-8 pipeline with emoji (color font) and CJK wide-cell support.
 - **Interaction:** pixel-smooth wheel scrolling, PageUp/PageDown/Home/End, live scrollbar scrubbing, drag selection with clipboard copy, Ctrl+wheel font zoom.
 - **Idle cost:** the render timer parks when nothing changes — 0% CPU at idle.
@@ -27,10 +27,12 @@ XAML:
 
 ```xml
 <Window ...
-        xmlns:chat="clr-namespace:IrcChatWpf;assembly=IrcChatControl.Wpf">
-    <chat:IrcChatControl x:Name="Chat" />
+        xmlns:irc="https://github.com/spenny2012/sIRCChatWindow">
+    <irc:IrcChatControl x:Name="Chat" />
 </Window>
 ```
+
+(The clr-namespace form `xmlns:irc="clr-namespace:IrcChatWpf;assembly=IrcChatControl.Wpf"` works too.)
 
 Code:
 
@@ -57,24 +59,42 @@ The native project always writes to `<submodule>/build/<Configuration>/` regardl
 | `AddLine(string text)` | Append a line (thread-safe, lock-free). mIRC + ANSI codes parsed inline. |
 | `Clear()` | Empty the scrollback (also decommits the arena). |
 | `LineCount` | Lines currently held in the ring buffer. |
+| `ScrollToEnd()` | Jump to the newest line and re-pin auto-follow. |
 | `SetMaxLines(int)` | Cap the scrollback line count at runtime. |
-| `SetBackgroundColor(Color)` / `SetForegroundColor(Color)` / `SetSelectionColor(Color)` | Theme the control. |
-| `SetFontFamily(string)` / `SetFontSize(double)` | Font control (default Consolas 14). |
+| `Background` / `Foreground` / `SelectionBrush` | Standard WPF brush properties — bindable, stylable, `DynamicResource`-friendly. Solid brushes reach the renderer. |
+| `FontFamily` / `FontSize` | Standard WPF font properties (default Consolas 14); inherit from the host window like any control. |
+| `SetBackgroundColor(Color)` / `SetForegroundColor(Color)` / `SetSelectionColor(Color)` / `SetFontFamily(string)` / `SetFontSize(double)` | Method equivalents of the properties above for code-driven theming. |
 | `EnableFontZoom` | Enable/disable Ctrl+wheel zoom (default on, clamped 6–72 pt). |
-| `CurrentFontSize` | The effective font size after zooming. |
+| `CurrentFontSize` | The effective font size after zooming (same value as `FontSize`). |
 
 Keyboard scrolling (PageUp/PageDown/Home/End) activates after the control has been clicked (it takes focus on mouse-down).
+
+### Theming
+
+The control themes like any WPF control — bind or style the standard properties:
+
+```xml
+<irc:IrcChatControl Background="{DynamicResource ChatBackgroundBrush}"
+                    Foreground="{DynamicResource ChatForegroundBrush}"
+                    FontFamily="Cascadia Mono" FontSize="13" />
+```
+
+Only `SolidColorBrush` values are forwarded to the native renderer (gradients/images can't be, and are applied to the WPF chrome only). `FontFamily`/`FontSize` are inherited properties, so a window-wide font cascades into the control; unstyled controls keep the console default (Consolas 14 on a dark palette). Theme changes are push-on-change only — nothing on the `AddLine`/render hot path reads these properties.
 
 ### Formatting codes
 
 | Code | Meaning |
 |------|---------|
 | `\x02` | Toggle bold |
-| `\x03` | mIRC foreground color, optional `,background` |
+| `\x03` | mIRC color index 0–98, optional `,background` (99/bare = default) |
+| `\x04` | Hex color `RRGGBB`, optional `,RRGGBB` background (bare = default) |
 | `\x0F` | Reset all formatting |
+| `\x16` | Toggle reverse video (swap fg/bg) |
+| `\x1D` | Toggle italic |
+| `\x1E` | Toggle strikethrough |
 | `\x1F` | Toggle underline |
-| `\x16` | Toggle italic |
-| `\x1B[...m` | ANSI SGR: styles, 16/256/truecolor via 38/48 |
+| `\x1B[...m` | ANSI SGR: styles (1/3/4/7/9…), 16/256/truecolor via 38/48 |
+| `\x01`, `\x11` | Stripped (CTCP delimiter; monospace toggle — layout is always monospace) |
 
 ## Building from source
 

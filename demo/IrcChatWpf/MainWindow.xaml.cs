@@ -64,6 +64,11 @@ namespace IrcChatWpf
             ChatControl.Clear();
         }
 
+        private void OnScrollToEndClick(object sender, RoutedEventArgs e)
+        {
+            ChatControl.ScrollToEnd();
+        }
+
         // Deterministic formatting showcase: mIRC classic/extended colors,
         // ANSI SGR colors (basic/256/truecolor), attributes, and malformed
         // escape sequences that must be stripped without residue. Rows stay
@@ -152,7 +157,17 @@ namespace IrcChatWpf
             }
             ChatControl.AddLine(sb.Append(Esc).Append("[0m").ToString());
 
-            ChatControl.AddLine($"attrs: {Esc}[3mitalic{Esc}[23m {Esc}[4munderline{Esc}[24m {Esc}[7mreverse{Esc}[27m {Esc}[1mbold{Esc}[22m plain");
+            ChatControl.AddLine($"attrs: {Esc}[3mitalic{Esc}[23m {Esc}[4munderline{Esc}[24m {Esc}[7mreverse{Esc}[27m {Esc}[9mstrike{Esc}[29m {Esc}[1mbold{Esc}[22m plain");
+
+            ChatControl.AddLine("=== mIRC attrs / hex colors / stripped codes ===");
+            ChatControl.AddLine("mirc attrs: bold italic underline strike reverse plain");
+            ChatControl.AddLine("reverse+color: 04,08red-on-yellow-swappedback-normal plain");
+            ChatControl.AddLine("hex fg: 45B7D1sky FF8800orange E91E63pink plain");
+            ChatControl.AddLine("hex fg,bg: FFD700,4B0082gold-on-indigo fg-reset-bg-stays plain");
+            ChatControl.AddLine("hex malformed: 12GHIJ<- bad hex resets fg, digits stay as text");
+            ChatControl.AddLine("ctcp: ACTION waves hello <- \\x01 delimiters must be invisible");
+            ChatControl.AddLine("mono toggle: abc <- \\x11 stripped, no gap");
+            ChatControl.AddLine("comma edge: 04,comma-kept-in-red plain (\\x03 04 + bare comma)");
             ChatControl.AddLine($"mixed: 04mirc-red {Esc}[32mansi-green +bold{Esc}[0m done plain");
 
             ChatControl.AddLine("=== malformed (must show clean text, no residue) ===");
@@ -286,9 +301,13 @@ namespace IrcChatWpf
                     if (_random.Next(2) == 0)
                         _sb.Append(",").Append(_random.Next(100));
                 }
-                if (_random.Next(10) == 0) _sb.Append('\u0002');
-                if (_random.Next(12) == 0) _sb.Append('\u001F');
-                if (_random.Next(14) == 0) _sb.Append('\u0016');
+                if (_random.Next(10) == 0) _sb.Append('\u0002'); // bold
+                if (_random.Next(12) == 0) _sb.Append('\u001F'); // underline
+                if (_random.Next(14) == 0) _sb.Append('\u001D'); // italic
+                if (_random.Next(16) == 0) _sb.Append('\u0016'); // reverse
+                if (_random.Next(18) == 0) _sb.Append('\u001E'); // strikethrough
+                if (_random.Next(20) == 0)
+                    _sb.Append('\u0004').Append(_random.Next(0x1000000).ToString("X6")); // hex color
 
                 if (_random.Next(8) == 0)
                 {

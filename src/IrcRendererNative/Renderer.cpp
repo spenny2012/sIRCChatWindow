@@ -520,6 +520,8 @@ void Renderer::UpdateLineHeight()
     m_lineHeight = m_fontSize * LineHeightRatio;
     m_underlineY = m_fontSize * 1.1f;
     m_underlineThickness = 1.0f;
+    m_strikeY = m_fontSize * 0.55f;
+    m_strikeThickness = 1.0f;
     if (m_fontFace)
     {
         DWRITE_FONT_METRICS metrics = {};
@@ -531,9 +533,13 @@ void Renderer::UpdateLineHeight()
             // underlinePosition is negative (below baseline).
             m_underlineY = (metrics.ascent - metrics.underlinePosition) * ratio;
             m_underlineThickness = std::max(metrics.underlineThickness * ratio, 1.0f);
+            // strikethroughPosition is positive (above baseline).
+            m_strikeY = (metrics.ascent - metrics.strikethroughPosition) * ratio;
+            m_strikeThickness = std::max(metrics.strikethroughThickness * ratio, 1.0f);
         }
     }
     m_underlineY = std::min(m_underlineY, m_lineHeight - m_underlineThickness);
+    m_strikeY = std::min(m_strikeY, m_lineHeight - m_strikeThickness);
 }
 
 void Renderer::EnsureBrushes()
@@ -802,6 +808,11 @@ void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
     {
         D2D1_RECT_F ul = Rect(x, y + m_underlineY, segWidth, m_underlineThickness);
         m_renderTarget->FillRectangle(&ul, brush);
+    }
+    if (flags & 0x08)
+    {
+        D2D1_RECT_F strike = Rect(x, y + m_strikeY, segWidth, m_strikeThickness);
+        m_renderTarget->FillRectangle(&strike, brush);
     }
 }
 
