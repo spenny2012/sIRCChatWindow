@@ -2,9 +2,7 @@ bin/
 obj/
 build/
 artifacts/
-.vs/
-.claude/
-.continue/
+.*/
 *.user
 *.log
 UpgradeLog*.htm
