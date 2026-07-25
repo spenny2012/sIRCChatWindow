@@ -2,12 +2,14 @@
 
 A high-throughput, console-style IRC chat control for WPF. Text is rendered by a native C++ DLL with Direct2D / DirectWrite into a D3D11 flip-model swapchain on a child HWND (hosted via `HwndHost`), bypassing WPF's retained-mode text stack entirely. A lock-free MPSC input queue and a fixed pre-allocated ring buffer let producer threads push thousands of lines per second without blocking the UI.
 
-- **Throughput:** 1,000–5,000+ lines/sec sustained; `AddLine` is thread-safe and allocation-free on the hot path.
-- **Scrollback:** 50,000-line pre-allocated ring buffer (configurable cap at runtime via `SetMaxLines`).
+- **Throughput:** 1,000–5,000+ lines/sec sustained; `AddLine` is thread-safe and cheap on the hot path.
+- **Scrollback:** 50,000-line pre-allocated ring buffer (configurable cap at runtime via `SetMaxLines`). The renderer is persistent: when the control leaves the visual tree its surface is parked (hidden and reparented), not destroyed, so hosts that cache and Content-swap chat views keep their history — and switching back costs a `SetParent`+`ShowWindow`, with no replay, re-parse, or GPU recreation.
 - **Formatting:** mIRC control codes (bold, italic, underline, strikethrough, reverse, indexed colors incl. the extended 0–98 range, `\x04` hex colors) and ANSI SGR escape sequences (`ESC[...m`, incl. 38/48 extended colors).
 - **Unicode:** full UTF-8 pipeline with emoji (color font) and CJK wide-cell support.
 - **Interaction:** pixel-smooth wheel scrolling, PageUp/PageDown/Home/End, live scrollbar scrubbing, drag selection with clipboard copy, Ctrl+wheel font zoom.
 - **Idle cost:** the render timer parks when nothing changes — 0% CPU at idle.
+- **Flash-free attach:** the surface window stays hidden until a theme-cleared frame is presented, and the first content frame renders synchronously at attach — cold rebuilds (e.g. `ParkedViewLimit=0` window switching) show chat immediately, with no black/white flash.
+- **Art-proof glyph atlas:** monochrome glyphs are cached as color-independent alpha masks tinted at draw time, so rainbow-colored ASCII/Unicode art can't thrash the cache; atlas texture creation is additionally hard-capped per frame.
 
 ## Requirements
 
@@ -56,11 +58,15 @@ The native project always writes to `<submodule>/build/<Configuration>/` regardl
 
 | Member | Description |
 |--------|-------------|
-| `AddLine(string text)` | Append a line (thread-safe, lock-free). mIRC + ANSI codes parsed inline. |
+| `AddLine(string text)` | Append a line (thread-safe). mIRC + ANSI codes parsed inline. Lines added while the control is unloaded are ingested immediately into the persistent scrollback. |
 | `Clear()` | Empty the scrollback (also decommits the arena). |
 | `LineCount` | Lines currently held in the ring buffer. |
 | `ScrollToEnd()` | Jump to the newest line and re-pin auto-follow. |
 | `SetMaxLines(int)` | Cap the scrollback line count at runtime. |
+| `WrapExtendedColors` | Classic-client color compatibility (default true): inbound `\x03` indices 16–98 fold onto the basic palette (mod 16) instead of the standardized extended palette. |
+| `ParkedViewLimit` (static) | How many hidden controls keep their GPU surface parked for instant reattach (default 2). Hidden controls beyond the limit release their surface — scrollback is unaffected — and rebuild in a few ms when shown again. |
+| `Dispose()` | Deterministically frees the native renderer (scrollback + GPU) when a chat window closes for good; otherwise the SafeHandle finalizer frees it eventually. |
+| `TrimMemory()` / `TrimAllMemory()` (static) | Returns committed scrollback memory no longer in use to the OS (native arena compaction + decommit; content intact). Hook `TrimAllMemory` into an idle timer. |
 | `Background` / `Foreground` / `SelectionBrush` | Standard WPF brush properties — bindable, stylable, `DynamicResource`-friendly. Solid brushes reach the renderer. |
 | `FontFamily` / `FontSize` | Standard WPF font properties (default Consolas 14); inherit from the host window like any control. |
 | `SetBackgroundColor(Color)` / `SetForegroundColor(Color)` / `SetSelectionColor(Color)` / `SetFontFamily(string)` / `SetFontSize(double)` | Method equivalents of the properties above for code-driven theming. |
@@ -86,7 +92,7 @@ Only `SolidColorBrush` values are forwarded to the native renderer (gradients/im
 | Code | Meaning |
 |------|---------|
 | `\x02` | Toggle bold |
-| `\x03` | mIRC color index 0–98, optional `,background` (99/bare = default) |
+| `\x03` | mIRC color index 0–98, optional `,background` (99 = default fg; bare resets fg **and** bg). Indices 16–98 fold mod-16 by default (`WrapExtendedColors`) |
 | `\x04` | Hex color `RRGGBB`, optional `,RRGGBB` background (bare = default) |
 | `\x0F` | Reset all formatting |
 | `\x16` | Toggle reverse video (swap fg/bg) |
@@ -148,7 +154,7 @@ The demo's [`App.xaml.cs`](demo/IrcChatWpf/App.xaml.cs) shows two optional, app-
 |----------|----------|--------|
 | `IrcLineCapacity` | `RingBuffer.h` | Compile-time scrollback capacity (50,000). |
 | `IrcLineTextSize` | `RingBuffer.h` | Max bytes per line (512). |
-| `IrcMaxSegments` | `RingBuffer.h` | Max color/format runs per line (16). |
+| `IrcMaxSegments` | `RingBuffer.h` | Max color/format runs per line (255 — enough for per-character colored ASCII art; storage packs by actual count). |
 | `InputQueueCapacity` | `Renderer.h` | Lock-free queue depth (power of two). |
 | `MaxInputBatch` | `Renderer.cpp` | Lines drained per frame; raise for >15k lines/sec. |
 | Timer interval | `IrcSwapchainHost.cs` | ~16 ms (60 FPS); parks at idle. |

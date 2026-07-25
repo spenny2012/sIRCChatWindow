@@ -1,4 +1,6 @@
 using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -14,7 +16,7 @@ namespace IrcChatWpf
     /// <see cref="Control.FontFamily"/>, and <see cref="Control.FontSize"/>
     /// properties (bindable; solid brushes reach the renderer) or the
     /// equivalent Set* methods.</summary>
-    public partial class IrcChatControl : UserControl
+    public partial class IrcChatControl : UserControl, IDisposable
     {
         private const double DefaultFontSizeDips = 14.0; // mirrors the native/host default
         private const double MinZoomFontSize = 6.0;
@@ -25,8 +27,44 @@ namespace IrcChatWpf
         private bool _selecting;
         private double _viewportDips; // cached so MouseMove skips a per-move native call
         private int _wheelZoomRemainder; // accumulates sub-notch deltas (precision touchpads)
-        private int? _maxLines; // set before the host exists → applied on creation
         private readonly DispatcherTimer _dragScrollTimer;
+
+        // The persistent native renderer (ring buffer + input queue + parked
+        // GPU surface), owned for the control's whole lifetime — scrollback
+        // genuinely lives native-side and survives the control leaving and
+        // re-entering the visual tree. Null only in the XAML designer. Freed
+        // deterministically by Dispose, or by the SafeHandle finalizer as a
+        // backstop.
+        private readonly SafeRendererHandle _renderer;
+        private bool _disposed;
+        private bool _wrapExtendedColors = true; // mirrors the native default
+
+        // LRU park registry (UI thread only — maintained from Loaded/Unloaded).
+        // Parked controls keep their GPU surface warm for instant switch-back;
+        // beyond ParkedViewLimit, the least-recently-hidden surface is
+        // destroyed (scrollback always survives) and rebuilt in a few ms if
+        // that window is revisited. Caps resident GPU cost at roughly
+        // (1 + limit) x ~20-30 MB regardless of how many windows are open.
+        private static readonly System.Collections.Generic.List<IrcChatControl> s_parkedViews = new System.Collections.Generic.List<IrcChatControl>();
+        private static int s_parkedViewLimit = 2;
+
+        // Every live (undisposed) control, for TrimAllMemory. UI thread only.
+        private static readonly System.Collections.Generic.List<IrcChatControl> s_liveControls = new System.Collections.Generic.List<IrcChatControl>();
+
+        /// <summary>How many hidden controls keep their native view parked
+        /// (GPU surface resident) for instant reattach. Hidden controls beyond
+        /// the limit have their surface destroyed — scrollback is unaffected —
+        /// and rebuild in a few milliseconds when shown again. Default 2.
+        /// UI thread only.</summary>
+        public static int ParkedViewLimit
+        {
+            get => s_parkedViewLimit;
+            set
+            {
+                s_parkedViewLimit = Math.Max(0, value);
+                TrimParkedViews();
+            }
+        }
 
         static IrcChatControl()
         {
@@ -47,11 +85,30 @@ namespace IrcChatWpf
                 new FrameworkPropertyMetadata(DefaultFontSizeDips, OnFontSizeChanged));
         }
 
-        /// <summary>Initializes the control. The native rendering surface is
-        /// created when the control is loaded into a window.</summary>
+        /// <summary>Initializes the control and its persistent native
+        /// scrollback. The rendering surface itself is created when the
+        /// control is first loaded into a window, then parked (not destroyed)
+        /// whenever the control leaves the visual tree.</summary>
         public IrcChatControl()
         {
             InitializeComponent();
+
+            if (!DesignerProperties.GetIsInDesignMode(this))
+            {
+                // Fail with an actionable message instead of the opaque
+                // BadImageFormat/DllNotFound the loader would produce.
+                if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+                    throw new PlatformNotSupportedException(
+                        "IrcChatControl.Wpf requires an x64 process (the native renderer ships as win-x64 only), " +
+                        $"but this process is {RuntimeInformation.ProcessArchitecture}. Set <PlatformTarget>x64</PlatformTarget> " +
+                        "in the host application project; on Windows ARM64 that runs the app under x64 emulation, which is supported.");
+
+                _renderer = NativeMethods.CreateRenderer();
+                if (_renderer.IsInvalid)
+                    throw new InvalidOperationException("Failed to create native IRC renderer.");
+                s_liveControls.Add(this);
+            }
+
             Loaded += OnLoaded;
             Unloaded += OnUnloaded;
             MouseWheel += OnMouseWheel;
@@ -69,6 +126,7 @@ namespace IrcChatWpf
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
+            s_parkedViews.Remove(this); // becoming visible: no longer parked
             RecreateOrResizeSurface();
         }
 
@@ -78,39 +136,139 @@ namespace IrcChatWpf
             if (_ircHost != null)
             {
                 _ircHost.FrameRendered -= OnFrameRendered;
+                ImageHost.Child = null; // DestroyWindowCore → DetachView (parks the surface)
+                _ircHost.Dispose();
+                _ircHost = null;
+
+                // Track as most-recently-parked; evict the oldest surface(s)
+                // over the limit so hidden windows don't pile up GPU stacks.
+                if (!_disposed)
+                {
+                    s_parkedViews.Remove(this);
+                    s_parkedViews.Add(this);
+                    TrimParkedViews();
+                }
+            }
+        }
+
+        private static void TrimParkedViews()
+        {
+            while (s_parkedViews.Count > s_parkedViewLimit)
+            {
+                IrcChatControl oldest = s_parkedViews[0];
+                s_parkedViews.RemoveAt(0);
+                if (oldest._renderer != null && !oldest._renderer.IsClosed)
+                    NativeMethods.ReleaseView(oldest._renderer);
+            }
+        }
+
+        /// <summary>Deterministically frees the native renderer — scrollback,
+        /// parked surface, and GPU stack — instead of waiting for GC
+        /// finalization. Call when the chat window is closed for good; the
+        /// control cannot be used afterward. UI thread only.</summary>
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+
+            // Tear down the live view first so no render tick or producer
+            // touches the handle mid-close.
+            CancelSelectionDrag();
+            if (_ircHost != null)
+            {
+                _ircHost.FrameRendered -= OnFrameRendered;
                 ImageHost.Child = null;
                 _ircHost.Dispose();
                 _ircHost = null;
             }
+            s_parkedViews.Remove(this);
+            s_liveControls.Remove(this);
+            _renderer?.Dispose(); // → DestroyRenderer (frees ring, arena, GPU)
         }
 
-        /// <summary>Appends one line to the scrollback. Thread-safe,
-        /// lock-free, and allocation-free on the hot path: any thread may call
-        /// this at thousands of lines per second. mIRC control codes and ANSI
-        /// SGR sequences are parsed inline; lines are capped at 512 UTF-8
-        /// bytes. Lines added before the control is loaded are dropped.</summary>
+        /// <summary>Returns committed scrollback memory no longer in use to
+        /// the OS (native arena compaction + decommit) — e.g. the high-water
+        /// left behind by a message flood after eviction. Scrollback content
+        /// is untouched. Cheap; intended for idle-time calls. UI thread only.</summary>
+        public void TrimMemory()
+        {
+            if (RendererAvailable)
+                NativeMethods.TrimStorage(_renderer);
+        }
+
+        /// <summary>Runs <see cref="TrimMemory"/> on every live control —
+        /// hook this into an application idle/trim timer. UI thread only.</summary>
+        public static void TrimAllMemory()
+        {
+            for (int i = 0; i < s_liveControls.Count; i++)
+                s_liveControls[i].TrimMemory();
+        }
+
+        /// <summary>Appends one line to the scrollback. Thread-safe and cheap:
+        /// any thread may call this at thousands of lines per second. mIRC
+        /// control codes and ANSI SGR sequences are parsed inline; lines are
+        /// capped at 512 UTF-8 bytes. The scrollback lives on the persistent
+        /// native renderer, so lines added while the control is unloaded are
+        /// ingested immediately and appear when it reloads — nothing is
+        /// dropped or replayed.</summary>
         public void AddLine(string text)
         {
-            _ircHost?.AddLine(text);
+            if (string.IsNullOrEmpty(text) || _renderer == null || _renderer.IsClosed)
+                return;
+
+            // Encode on the stack: this runs thousands of times per second from
+            // producer threads, and a heap byte[] per line just feeds the GC. The
+            // native side caps lines at 512 bytes, so anything past that is dropped.
+            Span<byte> buffer = stackalloc byte[512];
+            System.Text.Unicode.Utf8.FromUtf16(text.AsSpan(), buffer,
+                out _, out int bytesWritten);
+            if (bytesWritten > 0)
+            {
+                try
+                {
+                    NativeMethods.AddLine(_renderer, ref MemoryMarshal.GetReference(buffer), bytesWritten);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // A producer racing Dispose (window closed mid-flood):
+                    // the line is for a dead window — drop it.
+                    return;
+                }
+                _ircHost?.NotifyLinesPending(); // wake the attached view's timer, if any
+            }
         }
+
+        // False in the XAML designer and after Dispose. UI-thread members
+        // check this instead of null alone — a disposed SafeHandle throws
+        // ObjectDisposedException from P/Invoke marshaling otherwise.
+        private bool RendererAvailable => _renderer != null && !_renderer.IsClosed;
 
         /// <summary>Removes every line from the scrollback and decommits the
         /// backing text arena. UI thread only.</summary>
         public void Clear()
         {
-            _ircHost?.Clear();
+            if (!RendererAvailable)
+                return;
+            NativeMethods.Clear(_renderer);
+            _ircHost?.Wake();
         }
 
         /// <summary>Number of lines currently held in the scrollback ring
-        /// buffer (after any eviction by <see cref="SetMaxLines"/>).</summary>
-        public int LineCount => _ircHost?.LineCount ?? 0;
+        /// buffer (after any eviction by <see cref="SetMaxLines"/>). Stays
+        /// meaningful while the control is unloaded — the scrollback is
+        /// persistent. Zero after Dispose.</summary>
+        public int LineCount => RendererAvailable ? NativeMethods.GetLineCount(_renderer) : 0;
 
         /// <summary>Scrolls to the newest line and re-pins auto-follow, so
         /// subsequent <see cref="AddLine"/> calls keep the view at the
         /// bottom.</summary>
         public void ScrollToEnd()
         {
-            _ircHost?.ScrollToEnd();
+            if (!RendererAvailable)
+                return;
+            NativeMethods.ScrollToEnd(_renderer);
+            _ircHost?.Wake();
         }
 
         /// <summary>The tint drawn over selected text during mouse-drag
@@ -166,6 +324,22 @@ namespace IrcChatWpf
         /// [6, 72] DIPs; plain wheel scrolling is unaffected.</summary>
         public bool EnableFontZoom { get; set; } = true;
 
+        /// <summary>Classic-client color compatibility (default true): inbound
+        /// mIRC \x03 color indices 16–98 fold onto the basic 16-color palette
+        /// (index mod 16), the way pre-extended-palette clients rendered
+        /// rainbow spam and art. Set false to use the standardized extended
+        /// palette (modern mIRC behavior). Applies to newly added lines.</summary>
+        public bool WrapExtendedColors
+        {
+            get => _wrapExtendedColors;
+            set
+            {
+                _wrapExtendedColors = value;
+                if (RendererAvailable)
+                    NativeMethods.SetExtendedColorWrap(_renderer, value);
+            }
+        }
+
         /// <summary>The current rendering font size in DIPs (the
         /// <see cref="Control.FontSize"/> value, including Ctrl+wheel
         /// zoom).</summary>
@@ -189,43 +363,61 @@ namespace IrcChatWpf
             return brush;
         }
 
+        // The setters below write straight to the persistent renderer, which
+        // retains every value across view park/unpark — no re-push on attach.
+
         private static void OnBackgroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var c = (IrcChatControl)d;
             if (c.ImageHost != null)
                 c.ImageHost.Background = e.NewValue as Brush;
-            if (e.NewValue is SolidColorBrush brush)
-                c._ircHost?.SetBackgroundColor(PackArgb(brush.Color));
+            if (e.NewValue is SolidColorBrush brush && c.RendererAvailable)
+            {
+                NativeMethods.SetBackgroundColor(c._renderer, PackArgb(brush.Color));
+                c._ircHost?.Wake();
+            }
         }
 
         private static void OnForegroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var c = (IrcChatControl)d;
-            if (e.NewValue is SolidColorBrush brush)
-                c._ircHost?.SetForegroundColor(PackArgb(brush.Color));
+            if (e.NewValue is SolidColorBrush brush && c.RendererAvailable)
+            {
+                NativeMethods.SetForegroundColor(c._renderer, PackArgb(brush.Color));
+                c._ircHost?.Wake();
+            }
         }
 
         private static void OnSelectionBrushChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var c = (IrcChatControl)d;
-            if (e.NewValue is SolidColorBrush brush)
-                c._ircHost?.SetSelectionColor(PackArgba(brush.Color));
+            if (e.NewValue is SolidColorBrush brush && c.RendererAvailable)
+            {
+                NativeMethods.SetSelectionColor(c._renderer, PackArgba(brush.Color));
+                c._ircHost?.Wake();
+            }
         }
 
         private static void OnFontFamilyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var c = (IrcChatControl)d;
             string family = (e.NewValue as FontFamily)?.Source;
-            if (!string.IsNullOrEmpty(family))
-                c._ircHost?.SetFontFamily(family);
+            if (!string.IsNullOrEmpty(family) && c.RendererAvailable)
+            {
+                NativeMethods.SetFontFamily(c._renderer, family);
+                c._ircHost?.Wake();
+            }
         }
 
         private static void OnFontSizeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var c = (IrcChatControl)d;
             double size = (double)e.NewValue;
-            if (size > 0.0)
-                c._ircHost?.SetFontSize((float)size);
+            if (size > 0.0 && c.RendererAvailable)
+            {
+                NativeMethods.SetFontSize(c._renderer, (float)size);
+                c._ircHost?.Wake();
+            }
         }
 
         /// <summary>Sets the scrollback retention limit. Once reached, the
@@ -233,13 +425,13 @@ namespace IrcChatWpf
         /// Clamped natively to [1, 50000]; the 16 MiB text arena can evict
         /// earlier for extremely long lines. Shrinking below the current
         /// line count evicts immediately. Non-positive values are ignored.
-        /// Safe to call before the control is loaded.</summary>
+        /// Safe to call whether or not the control is loaded.</summary>
         public void SetMaxLines(int maxLines)
         {
-            if (maxLines <= 0)
+            if (maxLines <= 0 || !RendererAvailable)
                 return;
-            _maxLines = maxLines;
-            _ircHost?.SetMaxLines((uint)maxLines);
+            NativeMethods.SetMaxLines(_renderer, (uint)maxLines);
+            _ircHost?.Wake();
         }
 
         // Opaque: the swapchain has no per-pixel alpha, so a translucent
@@ -278,23 +470,19 @@ namespace IrcChatWpf
 
         private void RecreateOrResizeSurface()
         {
-            if (!TryGetViewportPixels(out int px, out int py, out DpiScale dpi))
+            if (_renderer == null || _renderer.IsClosed || _disposed
+                || !TryGetViewportPixels(out int px, out int py, out DpiScale dpi))
                 return;
 
             if (_ircHost == null)
             {
-                _ircHost = new IrcSwapchainHost(px, py, dpi.DpiScaleX);
-                // DP callbacks fire only on changes, so a fresh host needs the
-                // current values (defaults, styles, or pre-load sets) pushed.
-                if (Background is SolidColorBrush bg) _ircHost.SetBackgroundColor(PackArgb(bg.Color));
-                if (Foreground is SolidColorBrush fg) _ircHost.SetForegroundColor(PackArgb(fg.Color));
-                if (SelectionBrush is SolidColorBrush sel) _ircHost.SetSelectionColor(PackArgba(sel.Color));
-                string family = FontFamily?.Source;
-                if (!string.IsNullOrEmpty(family)) _ircHost.SetFontFamily(family);
-                if (FontSize > 0.0) _ircHost.SetFontSize((float)FontSize);
-                if (_maxLines is int ml) _ircHost.SetMaxLines((uint)ml);
+                // First load creates the native view; every later load unparks
+                // the surviving surface (SetParent + ShowWindow — the renderer
+                // retains theme, font, max-lines, and all scrollback, so
+                // nothing is re-pushed or replayed).
+                _ircHost = new IrcSwapchainHost(_renderer, px, py, dpi.DpiScaleX);
                 _ircHost.FrameRendered += OnFrameRendered;
-                ImageHost.Child = _ircHost;
+                ImageHost.Child = _ircHost; // BuildWindowCore → AttachView
             }
             else
             {

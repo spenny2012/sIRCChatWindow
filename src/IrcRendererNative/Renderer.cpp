@@ -76,6 +76,21 @@ namespace
         return registered;
     }
 
+    // Hidden top-level holder that parked child surfaces reparent to while
+    // their WPF host is out of the visual tree. Created lazily on the UI
+    // thread (DetachView), never shown, never destroyed — process-lifetime,
+    // like the window-class registration above.
+    HWND ParkingWindow()
+    {
+        static HWND holder = nullptr;
+        if (!holder && EnsureChildClass())
+        {
+            holder = CreateWindowExW(0, ChildClassName, L"IrcChatParking",
+                WS_OVERLAPPED, 0, 0, 1, 1, nullptr, nullptr, ThisModule(), nullptr);
+        }
+        return holder;
+    }
+
     // Greedy word wrap over the visible text of one line. Returns the number of
     // rows; if rowStarts is non-null it receives rows+1 offsets (rowStarts[r] is
     // where row r begins, rowStarts[rows] == length), so row r renders the range
@@ -216,6 +231,20 @@ bool Renderer::Initialize(HWND parent, int width, int height, float dpiScale)
     if (!CreateDWriteResources())
         return false;
 
+    // Present one theme-background frame BEFORE the window becomes visible,
+    // so its first composited pixels blend seamlessly with the WPF host
+    // background instead of flashing black/undefined. The caller presents
+    // the first real content frame right after attach.
+    if (m_renderTarget && m_swapChain)
+    {
+        m_renderTarget->BeginDraw();
+        D2D1_COLOR_F clearColor = ColorFromU32(m_bgColor);
+        m_renderTarget->Clear(&clearColor);
+        m_renderTarget->EndDraw();
+        m_swapChain->Present(0, 0);
+    }
+    ShowWindow(m_hwnd, SW_SHOWNA);
+
     m_dirty = true;
     return true;
 }
@@ -227,6 +256,75 @@ void Renderer::Shutdown()
     {
         DestroyWindow(m_hwnd);
         m_hwnd = nullptr;
+    }
+}
+
+bool Renderer::AttachView(HWND parent, int width, int height, float dpiScale)
+{
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+
+    bool ok;
+    if (m_hwnd && IsWindow(m_hwnd))
+    {
+        // Unpark the live surface. SetSize no-ops when geometry is unchanged
+        // and otherwise resizes the swapchain + defers a rewrap to the next
+        // frame — so a switch-back costs SetParent + ShowWindow.
+        SetParent(m_hwnd, parent);
+        SetSize(width, height, dpiScale);
+        ShowWindow(m_hwnd, SW_SHOW);
+        ok = true;
+    }
+    else
+    {
+        if (m_hwnd)
+        {
+            // The previous parent died and took the child HWND (and the
+            // swapchain bound to it) with it — drop the stale GPU stack and
+            // build fresh. Rewrap: metrics may differ after the rebuild.
+            ReleaseDeviceResources();
+            m_hwnd = nullptr;
+            m_needsRewrap = true;
+        }
+        ok = Initialize(parent, width, height, dpiScale);
+        if (ok && m_needsRewrap)
+            RewrapAll();
+    }
+
+    if (ok)
+    {
+        m_needsRewrap = false;
+        m_autoScroll = true;
+        m_scrollOffsetDips = 0.0;
+        m_selectionActive = false;
+        m_dirty = true;
+        m_viewAttached.store(true, std::memory_order_release);
+    }
+    return ok;
+}
+
+void Renderer::DetachView()
+{
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+    m_viewAttached.store(false, std::memory_order_release);
+    m_selectionActive = false;
+
+    if (!m_hwnd)
+        return;
+
+    HWND holder = IsWindow(m_hwnd) ? ParkingWindow() : nullptr;
+    if (holder)
+    {
+        // Park: keep the whole View (HWND, swapchain, D2D stack, glyph atlas)
+        // warm for a sub-millisecond reattach.
+        ShowWindow(m_hwnd, SW_HIDE);
+        SetParent(m_hwnd, holder);
+    }
+    else
+    {
+        // Child already destroyed with its parent, or no holder available:
+        // fall back to full View teardown; AttachView rebuilds from scratch.
+        Shutdown();
+        m_needsRewrap = true;
     }
 }
 
@@ -304,7 +402,10 @@ bool Renderer::CreateChildWindow(HWND parent, int width, int height)
     if (!parent || !EnsureChildClass())
         return false;
 
-    m_hwnd = CreateWindowExW(0, ChildClassName, L"", WS_CHILD | WS_VISIBLE,
+    // Created HIDDEN: a visible window whose swapchain has never presented
+    // flashes black/undefined pixels while the GPU stack initializes.
+    // Initialize() shows it only after the first (theme-cleared) Present.
+    m_hwnd = CreateWindowExW(0, ChildClassName, L"", WS_CHILD,
         0, 0, width, height, parent, nullptr, ThisModule(), nullptr);
     return m_hwnd != nullptr;
 }
@@ -571,13 +672,40 @@ IDWriteTextFormat* Renderer::GetTextFormat(uint8_t flags) const
     return m_textFormats[index];
 }
 
+namespace
+{
+    // Routes a cluster to the colored-BGRA raster path (COLR/emoji glyphs,
+    // which ignore the tint brush and must keep their own colors) vs the
+    // color-independent A8 mask path (everything else — block/box/braille/
+    // shade art, CJK, accented text — which tints correctly at draw time).
+    bool IsColorFontCandidate(uint32_t firstCp, const wchar_t* utf16, uint16_t wlen) noexcept
+    {
+        if (firstCp >= 0x1F000)
+            return true; // emoji planes
+        if ((firstCp >= 0x2600 && firstCp <= 0x27BF) ||
+            (firstCp >= 0x2B00 && firstCp <= 0x2BFF))
+            return true; // misc symbols/dingbats: may resolve to the color font
+        for (uint16_t k = 0; k < wlen; ++k)
+            if (utf16[k] == 0xFE0F)
+                return true; // explicit emoji presentation (VS16)
+        return false;
+    }
+}
+
 ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
-    uint8_t fmtIndex, uint8_t cells, uint32_t fgArgb)
+    uint8_t fmtIndex, uint8_t cells, uint32_t fgArgb, bool colorGlyph)
 {
     if (len == 0 || len > ClusterKeyMaxLen || !m_dwriteFactory || !m_atlasContext)
         return nullptr;
 
-    // FNV-1a over the UTF-16 units + format index + color.
+    // Monochrome clusters cache a color-independent A8 mask (tinted at draw
+    // time), so their key EXCLUDES the color — rainbow art collapses to one
+    // entry per glyph instead of one per (glyph, color). Color-font clusters
+    // keep the colored raster and color-inclusive key. fgArgb is always
+    // opaque, so 0 in the slot unambiguously marks an A8 entry.
+    const uint32_t keyColor = colorGlyph ? fgArgb : 0u;
+
+    // FNV-1a over the UTF-16 units + format index + key color.
     uint32_t h = 2166136261u;
     for (uint16_t k = 0; k < len; ++k)
     {
@@ -586,13 +714,18 @@ ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
     }
     h ^= fmtIndex;
     h *= 16777619u;
-    h ^= fgArgb;
+    h ^= keyColor;
     h *= 16777619u;
 
     ClusterEntry& e = m_clusterCache[h & (ClusterCacheSize - 1)];
-    if (e.bitmap && e.keyLen == len && e.fmt == fmtIndex && e.fgArgb == fgArgb &&
+    if (e.bitmap && e.keyLen == len && e.fmt == fmtIndex && e.fgArgb == keyColor &&
         std::memcmp(e.key, key, len * sizeof(wchar_t)) == 0)
         return e.bitmap;
+
+    // Cache miss past the frame's creation budget: render via the caller's
+    // DrawText fallback this frame instead of churning GPU textures.
+    if (m_atlasCreatesThisFrame >= AtlasCreateBudgetPerFrame)
+        return nullptr;
 
     IDWriteTextFormat* format = GetTextFormat(fmtIndex);
     if (!format)
@@ -611,7 +744,10 @@ ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
         return nullptr;
 
     D2D1_BITMAP_PROPERTIES1 props = {};
-    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    // Monochrome masks store coverage only (A8, 4x smaller); color glyphs
+    // need the full BGRA raster.
+    props.pixelFormat.format = colorGlyph ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                          : DXGI_FORMAT_A8_UNORM;
     props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
     props.dpiX = 96.0f * m_dpiScale;
     props.dpiY = 96.0f * m_dpiScale;
@@ -640,9 +776,12 @@ ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
     m_atlasContext->Clear(&clear);
     if (m_scratchBrush)
     {
-        m_scratchBrush->SetColor(ColorFromU32(fgArgb));
+        // Masks rasterize with an opaque white brush (only coverage lands in
+        // A8) and without ENABLE_COLOR_FONT; color glyphs bake their raster
+        // (they ignore the brush color anyway).
+        m_scratchBrush->SetColor(ColorFromU32(colorGlyph ? fgArgb : 0xFFFFFFFFu));
         m_atlasContext->DrawTextLayout(D2D1_POINT_2F{ 0.0f, 0.0f }, layout,
-            m_scratchBrush, m_drawTextOptions);
+            m_scratchBrush, colorGlyph ? m_drawTextOptions : D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
     hr = m_atlasContext->EndDraw();
     m_atlasContext->SetTarget(nullptr);
@@ -653,11 +792,12 @@ ID2D1Bitmap1* Renderer::GetClusterBitmap(const wchar_t* key, uint16_t len,
         return nullptr;
     }
 
+    ++m_atlasCreatesThisFrame;
     SafeRelease(e.bitmap); // direct-mapped: evict the collision victim
     std::memcpy(e.key, key, len * sizeof(wchar_t));
     e.keyLen = static_cast<uint8_t>(len);
     e.fmt = fmtIndex;
-    e.fgArgb = fgArgb;
+    e.fgArgb = keyColor;
     e.bitmap = bitmap;
     return e.bitmap;
 }
@@ -781,16 +921,33 @@ void Renderer::DrawSegment(const char* text, uint16_t length, float x, float y,
             const TextCells::Cluster cl = TextCells::NextCluster(text, i, length);
             const uint16_t wlen = TextCells::Utf8ToUtf16(text + i, cl.bytes, buffer);
             const uint32_t effFg = (fg & 0xFF000000u) ? fg : m_fgColor;
+            const bool colorGlyph = IsColorFontCandidate(
+                TextCells::DecodeUtf8(text, i, length).cp, buffer, wlen);
             ID2D1Bitmap1* cached = GetClusterBitmap(buffer, wlen,
-                static_cast<uint8_t>(flags & 0x03), cl.cells, effFg);
-            if (cached)
+                static_cast<uint8_t>(flags & 0x03), cl.cells, effFg, colorGlyph);
+            if (cached && colorGlyph)
             {
-                // Pre-rasterized: per frame this is a plain bitmap blit —
-                // no shaping, no fallback, no color-glyph layer translation.
+                // Pre-rasterized color glyph: a plain bitmap blit per frame.
                 const D2D1_SIZE_F bs = cached->GetSize();
                 const D2D1_RECT_F dst = Rect(x + cellX, y, bs.width, bs.height);
                 m_renderTarget->DrawBitmap(cached, &dst, 1.0f,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, nullptr);
+            }
+            else if (cached && m_scratchBrush)
+            {
+                // Color-independent A8 mask, tinted with the segment color at
+                // draw time — one cached raster serves every color, so rainbow
+                // art costs one entry per glyph. FillOpacityMask requires
+                // aliased antialiasing; the destination is cell-aligned, so
+                // nothing is lost.
+                const D2D1_SIZE_F bs = cached->GetSize();
+                const D2D1_RECT_F dst = Rect(x + cellX, y, bs.width, bs.height);
+                m_scratchBrush->SetColor(ColorFromU32(effFg));
+                const D2D1_ANTIALIAS_MODE prevAa = m_renderTarget->GetAntialiasMode();
+                m_renderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                m_renderTarget->FillOpacityMask(cached, m_scratchBrush,
+                    D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL, &dst, nullptr);
+                m_renderTarget->SetAntialiasMode(prevAa);
             }
             else
             {
@@ -824,7 +981,50 @@ bool Renderer::AddLine(const char* text, int length)
         length = static_cast<int>(IrcLineTextSize);
 
     // Enqueue a copy so the caller doesn't need to keep text alive.
-    return m_inputQueue.Enqueue(text, static_cast<uint16_t>(length));
+    bool accepted = m_inputQueue.Enqueue(text, static_cast<uint16_t>(length));
+
+    // With no attached View there is no render timer to drain the queue, so
+    // producers drain inline and scrollback keeps accumulating while the host
+    // control is unloaded. The attached hot path never reaches this branch.
+    if (!m_viewAttached.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(m_drainMutex);
+        if (!m_viewAttached.load(std::memory_order_relaxed))
+        {
+            if (!accepted)
+            {
+                // Queue was full (attached-mode flood, then detach): drain it,
+                // then this line fits.
+                if (m_hwnd) ProcessInputQueueLocked(); else DrainQueuePreView();
+                accepted = m_inputQueue.Enqueue(text, static_cast<uint16_t>(length));
+            }
+            if (m_hwnd)
+                ProcessInputQueueLocked(); // parked: metrics alive, full drain math
+            else
+                DrainQueuePreView();       // pre-View: parse/store only
+        }
+    }
+    return accepted;
+}
+
+// Parse and store queued lines before any View exists: no column metrics yet,
+// so rowCount is left 0 and the first AttachView runs RewrapAll. Caller holds
+// m_drainMutex.
+void Renderer::DrainQueuePreView()
+{
+    char buffer[IrcLineTextSize];
+    uint16_t length = 0;
+
+    LineSlot scratch;
+    while (m_inputQueue.Dequeue(buffer, length))
+    {
+        scratch.length = 0;
+        scratch.segmentCount = 0; // Parse appends from these; text needs no reset
+        IrcParser::Parse(&scratch, buffer, length, m_fgColor, m_bgColor, m_wrapExtended);
+        scratch.rowCount = 0;
+        m_ringBuffer.Append(scratch);
+        m_needsRewrap = true;
+    }
 }
 
 void Renderer::GetColumns(int& cols, int& contCols) const
@@ -856,6 +1056,14 @@ void Renderer::RewrapAll()
 
 void Renderer::ProcessInputQueue()
 {
+    // Serializes against producer inline drains (no attached View) and ring
+    // mutations from Clear/SetMaxLines; uncontended in attached steady state.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+    ProcessInputQueueLocked();
+}
+
+void Renderer::ProcessInputQueueLocked()
+{
     char buffer[IrcLineTextSize];
     uint16_t length = 0;
     int processed = 0;
@@ -869,7 +1077,7 @@ void Renderer::ProcessInputQueue()
     {
         scratch.length = 0;
         scratch.segmentCount = 0; // Parse appends from these; text needs no reset
-        IrcParser::Parse(&scratch, buffer, length, m_fgColor, m_bgColor);
+        IrcParser::Parse(&scratch, buffer, length, m_fgColor, m_bgColor, m_wrapExtended);
         scratch.rowCount = ComputeWrapRows(scratch.text, scratch.length,
             !(scratch.flags & LineFlagNonAscii), cols, contCols,
             nullptr, IrcLineTextSize);
@@ -940,6 +1148,7 @@ FrameResult Renderer::RenderFrame()
     if (!m_renderTarget || !m_dirty)
         return result;
 
+    m_atlasCreatesThisFrame = 0; // fresh atlas creation budget per drawn frame
     EnsureBrushes();
 
     m_renderTarget->BeginDraw();
@@ -1409,12 +1618,15 @@ void Renderer::SelectionEnd()
 
 void Renderer::Clear()
 {
+    // Mutates the ring: serialize against producer inline drains.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
     m_ringBuffer.Clear();
     m_totalRows = 0;
     m_scrollOffsetDips = 0.0;
     m_selectionActive = false; // anchors reference lines that no longer exist
     m_autoScroll = true;
     m_dirty = true;
+    m_needsRewrap = false; // nothing left to wrap
 }
 
 void Renderer::SetBackgroundColor(uint32_t argb)
@@ -1422,6 +1634,9 @@ void Renderer::SetBackgroundColor(uint32_t argb)
     argb |= 0xFF000000u; // opaque swapchain: force alpha
     if (argb == m_bgColor)
         return;
+    // Parse bakes the default colors into reverse-video spans, and with no
+    // attached View that parse runs on producer threads — serialize the write.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
     m_bgColor = argb;
     m_dirty = true;
 }
@@ -1431,6 +1646,7 @@ void Renderer::SetForegroundColor(uint32_t argb)
     argb |= 0xFF000000u;
     if (argb == m_fgColor)
         return;
+    std::lock_guard<std::mutex> lock(m_drainMutex); // see SetBackgroundColor
     m_fgColor = argb;
     if (m_defaultFgBrush)
         m_defaultFgBrush->SetColor(ColorFromU32(m_fgColor));
@@ -1474,9 +1690,39 @@ void Renderer::SetFontSize(float size)
 
 void Renderer::SetMaxLines(uint32_t maxLines)
 {
+    // Mutates the ring: serialize against producer inline drains.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
     m_totalRows -= m_ringBuffer.SetMaxLines(maxLines); // rows of evicted lines
     ClampScroll(); // content may have shrunk under the current offset
     m_dirty = true;
+}
+
+void Renderer::SetExtendedColorWrap(bool wrap)
+{
+    // Read at parse time, which runs on producer threads while detached.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+    m_wrapExtended = wrap;
+}
+
+void Renderer::TrimStorage()
+{
+    // Moves arena records: serialize against drains and other ring mutations.
+    // Rendering reads the ring via Get() on this same (UI) thread, so no
+    // stale pointers can be in flight while we hold the lock.
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+    m_ringBuffer.TrimStorage();
+}
+
+void Renderer::ReleaseView()
+{
+    std::lock_guard<std::mutex> lock(m_drainMutex);
+    if (m_viewAttached.load(std::memory_order_relaxed) || !m_hwnd)
+        return;
+
+    // Full View teardown for a parked surface (LRU eviction): scrollback and
+    // theme state stay; the next AttachView rebuilds and rewraps.
+    Shutdown();
+    m_needsRewrap = true;
 }
 
 void Renderer::GetScrollInfo(float* contentHeight, float* viewportHeight,
@@ -1490,15 +1736,20 @@ void Renderer::GetScrollInfo(float* contentHeight, float* viewportHeight,
 }
 
 // C exports
-extern "C" __declspec(dllexport) Renderer* CreateRenderer(HWND parent, int width, int height, float dpiScale)
+extern "C" __declspec(dllexport) Renderer* CreateRenderer()
 {
-    Renderer* r = new Renderer();
-    if (!r->Initialize(parent, width, height, dpiScale))
-    {
-        delete r;
-        return nullptr;
-    }
-    return r;
+    // Data only (ring buffer + input queue); the View attaches separately.
+    return new Renderer();
+}
+
+extern "C" __declspec(dllexport) bool AttachView(Renderer* renderer, HWND parent, int width, int height, float dpiScale)
+{
+    return renderer ? renderer->AttachView(parent, width, height, dpiScale) : false;
+}
+
+extern "C" __declspec(dllexport) void DetachView(Renderer* renderer)
+{
+    if (renderer) renderer->DetachView();
 }
 
 extern "C" __declspec(dllexport) HWND GetChildHwnd(Renderer* renderer)
@@ -1577,6 +1828,21 @@ extern "C" __declspec(dllexport) void SetFontSize(Renderer* renderer, float size
 extern "C" __declspec(dllexport) void SetMaxLines(Renderer* renderer, uint32_t maxLines)
 {
     if (renderer) renderer->SetMaxLines(maxLines);
+}
+
+extern "C" __declspec(dllexport) void SetExtendedColorWrap(Renderer* renderer, bool wrap)
+{
+    if (renderer) renderer->SetExtendedColorWrap(wrap);
+}
+
+extern "C" __declspec(dllexport) void ReleaseView(Renderer* renderer)
+{
+    if (renderer) renderer->ReleaseView();
+}
+
+extern "C" __declspec(dllexport) void TrimStorage(Renderer* renderer)
+{
+    if (renderer) renderer->TrimStorage();
 }
 
 extern "C" __declspec(dllexport) void Clear(Renderer* renderer)

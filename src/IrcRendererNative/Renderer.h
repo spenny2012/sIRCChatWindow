@@ -5,6 +5,8 @@
 #include "MpscQueue.h"
 #include "Palette.h"
 
+#include <atomic>
+#include <mutex>
 #include <string>
 
 // 1024 slots (~540 KB): the per-frame drain is MaxInputBatch (1024) lines, so
@@ -30,6 +32,17 @@ public:
 
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
+
+    // View lifecycle. The Renderer object itself is the persistent document
+    // (ring buffer + input queue survive for the object's lifetime); the View
+    // (child HWND + D3D/D2D/DWrite stack) attaches and detaches as the host
+    // control enters and leaves the WPF visual tree. DetachView PARKS the
+    // live View (hides the child HWND and reparents it to a hidden holder
+    // window) rather than destroying it, so a later AttachView is a
+    // SetParent + ShowWindow + possible resize — sub-millisecond, no GPU
+    // recreation, no rewrap. Both are UI-thread only.
+    bool AttachView(HWND parent, int width, int height, float dpiScale);
+    void DetachView();
 
     bool Initialize(HWND parent, int width, int height, float dpiScale);
     void Shutdown();
@@ -68,6 +81,21 @@ public:
     // evicts immediately. UI-thread only, like SetSize/Clear.
     void SetMaxLines(uint32_t maxLines);
 
+    // Classic-client color mode: when enabled (default), inbound \x03 indices
+    // 16-98 fold onto the basic palette modulo 16 instead of the standardized
+    // extended palette. Applies at parse time — new lines only.
+    void SetExtendedColorWrap(bool wrap);
+
+    // Returns committed scrollback bytes no longer in use to the OS (see
+    // RingBuffer::TrimStorage). Safe attached or detached; intended for the
+    // host's idle-time memory trim.
+    void TrimStorage();
+
+    // Destroys a parked View (HWND + GPU stack) without touching scrollback;
+    // no-op while a View is attached. Used by the managed LRU park limit.
+    // The next AttachView rebuilds from scratch. UI-thread only.
+    void ReleaseView();
+
     // Selection: coordinates are viewport-relative DIPs. Begin freezes
     // auto-scroll for the duration of the drag; End clears the selection and
     // restores it. GetText with buf == nullptr returns the required UTF-8
@@ -95,7 +123,10 @@ private:
     void ReleaseBackBufferResources();
     void ReleaseDeviceResources();
 
-    void ProcessInputQueue();
+    void ProcessInputQueue();       // takes m_drainMutex, then drains
+    void ProcessInputQueueLocked(); // caller holds m_drainMutex
+    void DrainQueuePreView();       // parse/store only (no wrap metrics yet);
+                                    // caller holds m_drainMutex
     void UpdateLineHeight();
     void EnsureBrushes();
 
@@ -118,15 +149,18 @@ private:
         float segWidth, uint32_t fg, uint32_t bg, uint8_t flags, bool asciiOnly);
     float MeasureSegment(const char* text, uint16_t length, uint8_t flags);
 
-    // Glyph-atlas cache for non-ASCII clusters: shaping, font fallback, AND
-    // color-glyph rasterization (COLRv1 emoji are dozens of gradient layers)
-    // run once per distinct (cluster, style, color); every frame after that
-    // is a plain DrawBitmap. Bitmaps are device resources, so the cache
-    // survives resizes; cleared on font change, DPI change, and shutdown.
-    // Returns null to request the uncached DrawText fallback (oversized key
-    // or creation failure).
+    // Glyph-atlas cache for non-ASCII clusters: shaping, font fallback, and
+    // rasterization run once per distinct cluster; every frame after that is
+    // a plain blit. Monochrome clusters (colorGlyph=false) cache a
+    // color-INDEPENDENT A8 coverage mask tinted at draw time via
+    // FillOpacityMask — one raster serves every color, so rainbow art cannot
+    // thrash the cache. Color-font clusters (emoji) cache a colored BGRA
+    // raster keyed by (cluster, style, color) as before. Bitmaps are device
+    // resources; cleared on font change, DPI change, and shutdown. Returns
+    // null to request the uncached DrawText fallback (oversized key, frame
+    // creation budget exhausted, or creation failure).
     ID2D1Bitmap1* GetClusterBitmap(const wchar_t* key, uint16_t len,
-        uint8_t fmtIndex, uint8_t cells, uint32_t fgArgb);
+        uint8_t fmtIndex, uint8_t cells, uint32_t fgArgb, bool colorGlyph);
     void ClearClusterCache();
 
     IDWriteTextFormat* GetTextFormat(uint8_t flags) const;
@@ -159,21 +193,27 @@ private:
     IDWriteFontFace*        m_fontFace = nullptr;
 
     // Cluster atlas cache: direct-mapped, ~32 KB table + <=512 small device
-    // bitmaps (~2 KB each; bounded, typically a handful of distinct emoji).
-    // 512 slots because fgArgb is in the key: truecolor-tinted cluster spam
-    // collides constantly at 128, degrading to per-frame re-rasterization.
+    // bitmaps (A8 masks ~0.5 KB, colored emoji ~2 KB; bounded). Monochrome
+    // entries exclude color from the key (tinted at draw time), so the slot
+    // count only has to cover distinct GLYPHS, not glyph x color products.
     static constexpr uint32_t ClusterCacheSize = 512; // power of 2
     static constexpr uint16_t ClusterKeyMaxLen = 24;  // UTF-16 units; longer bypasses
+    // Hard per-frame ceiling on atlas texture creations: a miss storm must
+    // never become an unbounded GPU create/release stream (the driver's
+    // deferred-destruction queue balloons by hundreds of MB). Overflow
+    // renders through the per-frame DrawText fallback for that frame.
+    static constexpr int AtlasCreateBudgetPerFrame = 256;
     struct ClusterEntry
     {
         wchar_t       key[ClusterKeyMaxLen];
         uint8_t       keyLen;  // 0 = empty slot
         uint8_t       fmt;     // format index (flags & 0x03)
-        uint32_t      fgArgb;  // baked text color (color glyphs ignore it,
-                               // monochrome fallback glyphs bake it)
+        uint32_t      fgArgb;  // color entries: baked raster color (opaque);
+                               // 0 marks a color-independent A8 mask entry
         ID2D1Bitmap1* bitmap;
     };
     ClusterEntry            m_clusterCache[ClusterCacheSize] = {};
+    int                     m_atlasCreatesThisFrame = 0;
     // Second context on the same device for rendering atlas entries while
     // the main context is inside BeginDraw (nested draws on one context are
     // illegal; separate contexts on one device are fine and share resources).
@@ -223,10 +263,27 @@ private:
 
     // Batching
     uint64_t                m_lastInputTime = 0;
+
+    // View-lifecycle coordination. The queue's only drainer is normally the
+    // attached View's RenderFrame; with no attached View, producers drain
+    // inline from AddLine so scrollback keeps accumulating while the host
+    // control is unloaded. m_drainMutex serializes those drains (and ring
+    // mutations from Clear/SetMaxLines) across the attach boundary;
+    // m_viewAttached lets the attached hot path skip the lock entirely.
+    std::mutex              m_drainMutex;
+    std::atomic<bool>       m_viewAttached{ false };
+    bool                    m_wrapExtended = true; // classic mod-16 fold of \x03 16-98;
+                                                   // guarded by m_drainMutex (parse-time read)
+    bool                    m_needsRewrap = false; // lines stored before the
+                                                   // first View existed have
+                                                   // rowCount 0; first attach
+                                                   // runs RewrapAll
 };
 
-extern "C" __declspec(dllexport) Renderer* CreateRenderer(HWND parent, int width, int height, float dpiScale);
+extern "C" __declspec(dllexport) Renderer* CreateRenderer();
 extern "C" __declspec(dllexport) void DestroyRenderer(Renderer* renderer);
+extern "C" __declspec(dllexport) bool AttachView(Renderer* renderer, HWND parent, int width, int height, float dpiScale);
+extern "C" __declspec(dllexport) void DetachView(Renderer* renderer);
 extern "C" __declspec(dllexport) HWND GetChildHwnd(Renderer* renderer);
 extern "C" __declspec(dllexport) bool AddLine(Renderer* renderer, const char* text, int length);
 extern "C" __declspec(dllexport) bool RenderFrame(Renderer* renderer, int* dirtyX, int* dirtyY, int* dirtyW, int* dirtyH);
@@ -241,6 +298,9 @@ extern "C" __declspec(dllexport) void SetSelectionColor(Renderer* renderer, uint
 extern "C" __declspec(dllexport) void SetFontFamily(Renderer* renderer, const wchar_t* family);
 extern "C" __declspec(dllexport) void SetFontSize(Renderer* renderer, float size);
 extern "C" __declspec(dllexport) void SetMaxLines(Renderer* renderer, uint32_t maxLines);
+extern "C" __declspec(dllexport) void SetExtendedColorWrap(Renderer* renderer, bool wrap);
+extern "C" __declspec(dllexport) void ReleaseView(Renderer* renderer);
+extern "C" __declspec(dllexport) void TrimStorage(Renderer* renderer);
 extern "C" __declspec(dllexport) int GetLineCount(Renderer* renderer);
 // "Chat" prefix avoids an extern "C" clash with the Win32 GetScrollInfo in winuser.h.
 extern "C" __declspec(dllexport) void GetChatScrollInfo(Renderer* renderer, float* contentHeight,

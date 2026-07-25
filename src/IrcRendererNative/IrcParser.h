@@ -10,7 +10,9 @@ namespace IrcParser
     // text; formatting is resolved to packed colors in the segments.
     // defaultFg/defaultBg (0xAARRGGBB) substitute for "no explicit color" in
     // reverse-video swaps, so they bake the theme current at parse time.
+    // wrapExtended maps \x03 indices 16-98 onto the basic palette modulo 16
+    // (classic-client look) instead of the standardized extended palette.
     // No allocations, no exceptions.
     void Parse(LineSlot* slot, const char* text, uint16_t length,
-        uint32_t defaultFg, uint32_t defaultBg) noexcept;
+        uint32_t defaultFg, uint32_t defaultBg, bool wrapExtended) noexcept;
 }

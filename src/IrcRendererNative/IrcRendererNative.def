@@ -2,6 +2,8 @@ LIBRARY IrcRendererNative
 EXPORTS
     CreateRenderer
     DestroyRenderer
+    AttachView
+    DetachView
     GetChildHwnd
     AddLine
     RenderFrame
@@ -16,6 +18,9 @@ EXPORTS
     SetFontFamily
     SetFontSize
     SetMaxLines
+    SetExtendedColorWrap
+    ReleaseView
+    TrimStorage
     GetLineCount
     GetChatScrollInfo
     SelectionBegin

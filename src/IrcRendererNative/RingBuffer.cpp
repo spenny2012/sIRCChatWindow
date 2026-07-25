@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "RingBuffer.h"
 
+#include <new>
+
 namespace
 {
     // Records start 4-aligned so the Segment array (alignof 4) inside each
@@ -12,12 +14,23 @@ namespace
 }
 
 RingBuffer::RingBuffer()
-    : m_meta(new LineMeta[IrcLineCapacity])
 {
     // Reserve-only: commit charge (private bytes) accrues in 1 MiB steps as
-    // scrollback actually grows, instead of 16 MiB up front.
+    // scrollback actually grows, instead of 16 MiB up front. The meta ring is
+    // likewise allocated lazily (EnsureMeta), sized to the cap in effect.
     m_arena = static_cast<char*>(::VirtualAlloc(nullptr, IrcArenaBytes,
         MEM_RESERVE, PAGE_READWRITE));
+}
+
+bool RingBuffer::EnsureMeta() noexcept
+{
+    if (m_meta)
+        return true;
+    m_meta.reset(new(std::nothrow) LineMeta[m_maxLines]);
+    if (!m_meta)
+        return false;
+    m_metaCapacity = m_maxLines;
+    return true;
 }
 
 RingBuffer::~RingBuffer()
@@ -49,7 +62,7 @@ bool RingBuffer::EnsureCommitted(uint32_t end) noexcept
 uint32_t RingBuffer::EvictOldest() noexcept
 {
     const uint32_t rows = m_meta[m_head].rowCount;
-    m_head = (m_head + 1) % IrcLineCapacity;
+    m_head = (m_head + 1) % m_metaCapacity;
     --m_count;
     ++m_evictedTotal;
     if (m_count == 0)
@@ -59,6 +72,10 @@ uint32_t RingBuffer::EvictOldest() noexcept
 
 uint32_t RingBuffer::Append(const LineSlot& slot) noexcept
 {
+    // Allocation failure (OOM-level) drops the line, same as commit failure.
+    if (!EnsureMeta())
+        return slot.rowCount;
+
     const uint32_t segBytes = static_cast<uint32_t>(slot.segmentCount) * sizeof(Segment);
     const uint32_t recordBytes = AlignUp(segBytes + slot.length);
 
@@ -118,7 +135,7 @@ uint32_t RingBuffer::Append(const LineSlot& slot) noexcept
     std::memcpy(dst, slot.segments, segBytes);
     std::memcpy(dst + segBytes, slot.text, slot.length);
 
-    LineMeta& meta = m_meta[(m_head + m_count) % IrcLineCapacity];
+    LineMeta& meta = m_meta[(m_head + m_count) % m_metaCapacity];
     meta.arenaOffset = start;
     meta.timestamp = static_cast<uint32_t>(GetTickCount64());
     meta.length = slot.length;
@@ -142,7 +159,61 @@ uint32_t RingBuffer::SetMaxLines(uint32_t maxLines) noexcept
     uint32_t evictedRows = 0;
     while (m_count > m_maxLines)
         evictedRows += EvictOldest();
+
+    // Right-size the meta ring so a small cap costs small memory (~16 B per
+    // line). Unallocated meta stays lazy — EnsureMeta sizes it to the cap in
+    // effect at first Append. On allocation failure, keep the old ring.
+    if (m_meta && m_maxLines != m_metaCapacity)
+    {
+        LineMeta* next = new(std::nothrow) LineMeta[m_maxLines];
+        if (next)
+        {
+            for (uint32_t i = 0; i < m_count; ++i)
+                next[i] = m_meta[(m_head + i) % m_metaCapacity];
+            m_meta.reset(next);
+            m_metaCapacity = m_maxLines;
+            m_head = 0;
+        }
+    }
     return evictedRows;
+}
+
+void RingBuffer::TrimStorage() noexcept
+{
+    if (!m_arena || m_committedBytes == 0)
+        return;
+
+    if (m_count == 0)
+    {
+        m_writeOffset = 0;
+        ::VirtualFree(m_arena, m_committedBytes, MEM_DECOMMIT);
+        m_committedBytes = 0;
+        return;
+    }
+
+    // Live records are contiguous only when [oldest, writeOffset) doesn't
+    // wrap; a wrapped (or ambiguous equal-offset) layout is left untouched.
+    const uint32_t oldest = m_meta[m_head].arenaOffset;
+    if (oldest >= m_writeOffset)
+        return;
+
+    const uint32_t spanBytes = m_writeOffset - oldest;
+    if (oldest > 0)
+    {
+        // dest < src: memmove handles the overlap; then rebase every offset.
+        std::memmove(m_arena, m_arena + oldest, spanBytes);
+        for (uint32_t i = 0; i < m_count; ++i)
+            m_meta[(m_head + i) % m_metaCapacity].arenaOffset -= oldest;
+        m_writeOffset = spanBytes;
+    }
+
+    constexpr uint32_t Page = 4096;
+    const uint32_t keep = ((m_writeOffset + Page - 1) / Page) * Page;
+    if (keep < m_committedBytes)
+    {
+        ::VirtualFree(m_arena + keep, m_committedBytes - keep, MEM_DECOMMIT);
+        m_committedBytes = keep;
+    }
 }
 
 void RingBuffer::Clear() noexcept
@@ -169,7 +240,7 @@ LineView RingBuffer::Get(uint32_t logicalIndex) const noexcept
     if (logicalIndex >= m_count)
         return view;
 
-    const LineMeta& meta = m_meta[(m_head + logicalIndex) % IrcLineCapacity];
+    const LineMeta& meta = m_meta[(m_head + logicalIndex) % m_metaCapacity];
     const char* base = m_arena + meta.arenaOffset;
     view.segments = reinterpret_cast<const Segment*>(base);
     view.text = base + static_cast<uint32_t>(meta.segmentCount) * sizeof(Segment);
@@ -183,5 +254,5 @@ LineView RingBuffer::Get(uint32_t logicalIndex) const noexcept
 void RingBuffer::SetRowCount(uint32_t logicalIndex, uint16_t rows) noexcept
 {
     if (logicalIndex < m_count)
-        m_meta[(m_head + logicalIndex) % IrcLineCapacity].rowCount = rows;
+        m_meta[(m_head + logicalIndex) % m_metaCapacity].rowCount = rows;
 }

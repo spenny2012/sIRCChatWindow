@@ -5,13 +5,14 @@
 
 namespace
 {
-    // 0-15 match the classic mIRC colors the renderer's brush table used;
-    // 16-98 is the standardized extended palette (modern.ircdocs.horse).
+    // 0-15 are the canonical mIRC colors (modern.ircdocs.horse) — NOT the
+    // classic VGA values, which are visibly off on green/orange/greys;
+    // 16-98 is the standardized extended palette (same source).
     constexpr uint32_t g_mirc[99] = {
-        0xFFFFFFFFu, 0xFF000000u, 0xFF000080u, 0xFF008000u, // 0-3
-        0xFFFF0000u, 0xFF800000u, 0xFF800080u, 0xFFFF8000u, // 4-7
-        0xFFFFFF00u, 0xFF00FF00u, 0xFF008080u, 0xFF00FFFFu, // 8-11
-        0xFF0000FFu, 0xFFFF00FFu, 0xFF808080u, 0xFFBFBFBFu, // 12-15
+        0xFFFFFFFFu, 0xFF000000u, 0xFF00007Fu, 0xFF009300u, // 0-3
+        0xFFFF0000u, 0xFF7F0000u, 0xFF9C009Cu, 0xFFFC7F00u, // 4-7
+        0xFFFFFF00u, 0xFF00FC00u, 0xFF009393u, 0xFF00FFFFu, // 8-11
+        0xFF0000FCu, 0xFFFF00FFu, 0xFF7F7F7Fu, 0xFFD2D2D2u, // 12-15
         0xFF470000u, 0xFF472100u, 0xFF474700u, 0xFF324700u, 0xFF004700u, 0xFF00472Cu,
         0xFF004747u, 0xFF002747u, 0xFF000047u, 0xFF2E0047u, 0xFF470047u, 0xFF47002Au, // 16-27
         0xFF740000u, 0xFF743A00u, 0xFF747400u, 0xFF517400u, 0xFF007400u, 0xFF007449u,

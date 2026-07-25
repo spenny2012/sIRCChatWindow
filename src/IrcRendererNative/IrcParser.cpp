@@ -37,6 +37,17 @@ namespace
         return value;
     }
 
+    // mIRC index -> packed color, honoring the classic-client wrap mode:
+    // wrapped, indices 16-98 fold onto the basic 16-color palette (index % 16,
+    // the pre-extended-palette behavior spam/art scripts assume); unwrapped,
+    // they use the standardized extended palette.
+    inline uint32_t MircColor(uint8_t index, bool wrapExtended) noexcept
+    {
+        if (wrapExtended && index >= 16 && index <= 98)
+            index = static_cast<uint8_t>(index % 16);
+        return IrcPalette::Mirc(index);
+    }
+
     // Parses exactly six hex digits at text[pos] into 0xRRGGBB. Consumes them
     // only on success, so partial digits stay in the text.
     inline bool ParseHex6(const char* text, uint16_t& pos, uint16_t length, uint32_t& outRgb) noexcept
@@ -252,7 +263,7 @@ namespace
 }
 
 void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
-    uint32_t defaultFg, uint32_t defaultBg) noexcept
+    uint32_t defaultFg, uint32_t defaultBg, bool wrapExtended) noexcept
 {
     Style st;
     uint16_t segmentStart = 0;
@@ -323,6 +334,9 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
         {
             FlushSegment(slot, segmentStart, slot->length, st, defaultFg, defaultBg);
             ++i;
+            // A truly bare \x03 (no digits at all) resets BOTH colors — mIRC
+            // behavior; index 99 resets only the foreground.
+            const bool bare = i >= length || !IsDigit(text[i]);
             const uint8_t newFg = ParseColor(text, i, length);
             uint8_t newBg = MircIndexDefault;
             // The comma is only part of the code when digits follow;
@@ -332,12 +346,13 @@ void IrcParser::Parse(LineSlot* slot, const char* text, uint16_t length,
                 ++i;
                 newBg = ParseColor(text, i, length);
             }
-            // Bare \x03 (or index 99) resets fg but leaves bg untouched.
-            st.fg = (newFg != MircIndexDefault) ? IrcPalette::Mirc(newFg)
+            st.fg = (newFg != MircIndexDefault) ? MircColor(newFg, wrapExtended)
                                                 : IrcPalette::Default;
             st.fgBase = 0xFF;
             if (newBg != MircIndexDefault)
-                st.bg = IrcPalette::Mirc(newBg);
+                st.bg = MircColor(newBg, wrapExtended);
+            else if (bare)
+                st.bg = IrcPalette::Default;
             segmentStart = slot->length;
             continue;
         }

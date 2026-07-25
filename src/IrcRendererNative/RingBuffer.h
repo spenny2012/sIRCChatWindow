@@ -4,7 +4,14 @@
 
 constexpr uint32_t IrcLineCapacity = 50000;
 constexpr uint32_t IrcLineTextSize = 512;
-constexpr uint32_t IrcMaxSegments = 16;
+// 255 is the practical ceiling: raw input is clamped to IrcLineTextSize bytes
+// and every segment costs >= 2 raw bytes (control code + visible char), so a
+// line cannot encode meaningfully more runs — and uint8_t segmentCount tops
+// out here anyway. Colored ASCII art routinely carries dozens of runs per
+// line; capping lower truncates its colors mid-line (the old 16 did exactly
+// that). Storage is packed by ACTUAL count, so normal 1-3 segment chat lines
+// pay nothing for this headroom.
+constexpr uint32_t IrcMaxSegments = 255;
 
 // Byte budget for packed line storage. Typical traffic (~200 B/line) hits the
 // 50k line cap well under this; worst-case max-length lines retain ~24k lines
@@ -39,7 +46,7 @@ struct LineSlot
     uint8_t  flags;         // LineFlag* bits
 };
 
-static_assert(sizeof(LineSlot) <= 720, "LineSlot should stay compact");
+static_assert(sizeof(LineSlot) <= 3600, "LineSlot is stack-only ingest scratch; keep it a few KB");
 
 // Read-only view of a stored line. Pointers reference the arena and stay valid
 // only until the next Append/Clear (single-threaded: render thread only).
@@ -71,11 +78,20 @@ public:
     // rows of the evicted lines so the caller can maintain its row total.
     uint32_t Append(const LineSlot& slot) noexcept;
 
-    // Runtime retention limit, clamped to [1, IrcLineCapacity] (the physical
-    // meta ring never reallocates). Shrinking evicts oldest lines down to the
-    // new cap immediately. Returns the total wrapped rows of the evicted
-    // lines (same contract as Append).
+    // Runtime retention limit, clamped to [1, IrcLineCapacity]. Shrinking
+    // evicts oldest lines down to the new cap immediately, and the meta ring
+    // is reallocated to the cap so a small cap costs small memory (~16 B per
+    // line). Returns the total wrapped rows of the evicted lines (same
+    // contract as Append).
     uint32_t SetMaxLines(uint32_t maxLines) noexcept;
+
+    // Returns committed arena bytes to the OS after scrollback shrinks (a
+    // flood high-water no longer in use, or a lowered cap). Only acts when
+    // the live records form one contiguous span: the span is moved to the
+    // arena start and everything past it is decommitted. A wrapped span is a
+    // safe no-op (resolves via churn or Clear). Intended for idle-time calls;
+    // O(live bytes).
+    void TrimStorage() noexcept;
 
     void Clear() noexcept;
 
@@ -109,9 +125,17 @@ private:
     // the OS refuses the commit (the caller then drops the line).
     bool EnsureCommitted(uint32_t end) noexcept;
 
+    // Allocates the meta ring on first use, sized to the cap in effect —
+    // hosts that lower the cap before the first line never pay for the
+    // 50k-entry default.
+    bool EnsureMeta() noexcept;
+
+    // Lazily allocated by EnsureMeta and resized by SetMaxLines; capacity is
+    // m_metaCapacity (NOT IrcLineCapacity — always index modulo the former).
     std::unique_ptr<LineMeta[]> m_meta;
+    uint32_t                    m_metaCapacity = 0;
     char*                       m_arena = nullptr; // VirtualAlloc reserve; committed on demand
-    uint32_t                    m_maxLines = IrcLineCapacity; // logical cap; ring stays physical
+    uint32_t                    m_maxLines = IrcLineCapacity; // logical cap
     uint32_t                    m_committedBytes = 0;
     uint32_t                    m_head = 0;        // meta index of oldest line
     uint32_t                    m_count = 0;
