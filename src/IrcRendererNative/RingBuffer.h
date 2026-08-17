@@ -86,11 +86,10 @@ public:
     uint32_t SetMaxLines(uint32_t maxLines) noexcept;
 
     // Returns committed arena bytes to the OS after scrollback shrinks (a
-    // flood high-water no longer in use, or a lowered cap). Only acts when
-    // the live records form one contiguous span: the span is moved to the
-    // arena start and everything past it is decommitted. A wrapped span is a
-    // safe no-op (resolves via churn or Clear). Intended for idle-time calls;
-    // O(live bytes).
+    // flood high-water no longer in use, or a lowered cap). Live records are
+    // repacked to the arena start — in place for a contiguous span, via a
+    // temp copy for a wrapped one — and everything past them is decommitted.
+    // Intended for idle-time calls; O(live bytes).
     void TrimStorage() noexcept;
 
     void Clear() noexcept;

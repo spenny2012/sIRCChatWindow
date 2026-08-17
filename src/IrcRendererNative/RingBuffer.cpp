@@ -191,20 +191,53 @@ void RingBuffer::TrimStorage() noexcept
         return;
     }
 
-    // Live records are contiguous only when [oldest, writeOffset) doesn't
-    // wrap; a wrapped (or ambiguous equal-offset) layout is left untouched.
     const uint32_t oldest = m_meta[m_head].arenaOffset;
-    if (oldest >= m_writeOffset)
-        return;
-
-    const uint32_t spanBytes = m_writeOffset - oldest;
-    if (oldest > 0)
+    if (oldest < m_writeOffset)
     {
-        // dest < src: memmove handles the overlap; then rebase every offset.
-        std::memmove(m_arena, m_arena + oldest, spanBytes);
+        // Contiguous span [oldest, writeOffset): slide it to the arena start
+        // in place. dest < src: memmove handles the overlap; then rebase
+        // every offset.
+        const uint32_t spanBytes = m_writeOffset - oldest;
+        if (oldest > 0)
+        {
+            std::memmove(m_arena, m_arena + oldest, spanBytes);
+            for (uint32_t i = 0; i < m_count; ++i)
+                m_meta[(m_head + i) % m_metaCapacity].arenaOffset -= oldest;
+            m_writeOffset = spanBytes;
+        }
+    }
+    else
+    {
+        // Wrapped (or ambiguous equal-offset) span: repack every live record
+        // in logical order through a temp buffer, since the destination
+        // overlaps both fragments. Live bytes are bounded by the line cap, so
+        // this is at most a few MB; on allocation failure keep the current
+        // layout (same outcome as the old unconditional no-op).
+        uint32_t packedBytes = 0;
         for (uint32_t i = 0; i < m_count; ++i)
-            m_meta[(m_head + i) % m_metaCapacity].arenaOffset -= oldest;
-        m_writeOffset = spanBytes;
+        {
+            const LineMeta& meta = m_meta[(m_head + i) % m_metaCapacity];
+            packedBytes += AlignUp(
+                static_cast<uint32_t>(meta.segmentCount) * sizeof(Segment) + meta.length);
+        }
+
+        std::unique_ptr<char[]> temp(new(std::nothrow) char[packedBytes]);
+        if (!temp)
+            return;
+
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < m_count; ++i)
+        {
+            LineMeta& meta = m_meta[(m_head + i) % m_metaCapacity];
+            const uint32_t recordBytes = AlignUp(
+                static_cast<uint32_t>(meta.segmentCount) * sizeof(Segment) + meta.length);
+            std::memcpy(temp.get() + dst, m_arena + meta.arenaOffset, recordBytes);
+            meta.arenaOffset = dst;
+            dst += recordBytes;
+        }
+
+        std::memcpy(m_arena, temp.get(), packedBytes);
+        m_writeOffset = packedBytes;
     }
 
     constexpr uint32_t Page = 4096;

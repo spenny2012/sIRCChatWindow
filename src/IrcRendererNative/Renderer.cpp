@@ -338,6 +338,12 @@ void Renderer::DetachView()
         Shutdown();
         m_needsRewrap = true;
     }
+
+    // A detached window's ring is quiescent (drains only run attached), so
+    // this is the natural point to return a flood high-water's committed
+    // pages to the OS. Direct ring call: m_drainMutex is already held here,
+    // and the public TrimStorage() wrapper would self-deadlock.
+    m_ringBuffer.TrimStorage();
 }
 
 // Everything holding a reference to the swapchain's back buffer — required
