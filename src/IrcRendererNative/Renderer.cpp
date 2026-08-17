@@ -235,14 +235,7 @@ bool Renderer::Initialize(HWND parent, int width, int height, float dpiScale)
     // so its first composited pixels blend seamlessly with the WPF host
     // background instead of flashing black/undefined. The caller presents
     // the first real content frame right after attach.
-    if (m_renderTarget && m_swapChain)
-    {
-        m_renderTarget->BeginDraw();
-        D2D1_COLOR_F clearColor = ColorFromU32(m_bgColor);
-        m_renderTarget->Clear(&clearColor);
-        m_renderTarget->EndDraw();
-        m_swapChain->Present(0, 0);
-    }
+    PresentBackgroundFrame();
     ShowWindow(m_hwnd, SW_SHOWNA);
 
     m_dirty = true;
@@ -259,6 +252,18 @@ void Renderer::Shutdown()
     }
 }
 
+void Renderer::PresentBackgroundFrame()
+{
+    if (!m_renderTarget || !m_swapChain)
+        return;
+
+    m_renderTarget->BeginDraw();
+    D2D1_COLOR_F clearColor = ColorFromU32(m_bgColor);
+    m_renderTarget->Clear(&clearColor);
+    m_renderTarget->EndDraw();
+    m_swapChain->Present(0, 0);
+}
+
 bool Renderer::AttachView(HWND parent, int width, int height, float dpiScale)
 {
     std::lock_guard<std::mutex> lock(m_drainMutex);
@@ -267,10 +272,17 @@ bool Renderer::AttachView(HWND parent, int width, int height, float dpiScale)
     if (m_hwnd && IsWindow(m_hwnd))
     {
         // Unpark the live surface. SetSize no-ops when geometry is unchanged
-        // and otherwise resizes the swapchain + defers a rewrap to the next
-        // frame — so a switch-back costs SetParent + ShowWindow.
+        // and otherwise resizes the swapchain (ResizeBuffers discards its
+        // back buffer) + defers a rewrap to the next frame. When the geometry
+        // did change, present a themed background frame before showing the
+        // window — same guard Initialize uses on cold attach — so the
+        // discarded buffer's undefined content never reaches the screen; the
+        // caller presents the first real content frame right after attach.
+        const bool sizeChanging = (width != m_width) || (height != m_height);
         SetParent(m_hwnd, parent);
         SetSize(width, height, dpiScale);
+        if (sizeChanging)
+            PresentBackgroundFrame();
         ShowWindow(m_hwnd, SW_SHOW);
         ok = true;
     }

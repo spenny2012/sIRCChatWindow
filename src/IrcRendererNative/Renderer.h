@@ -123,6 +123,13 @@ private:
     void ReleaseBackBufferResources();
     void ReleaseDeviceResources();
 
+    // Clears to the current theme background and presents once, so a surface
+    // whose buffer content is stale/undefined never reaches the screen before
+    // the caller's next real content frame. Used before showing the window on
+    // cold attach and after a geometry-changing reattach (ResizeBuffers
+    // discards the back buffer). No-ops if the D3D/D2D stack isn't up yet.
+    void PresentBackgroundFrame();
+
     void ProcessInputQueue();       // takes m_drainMutex, then drains
     void ProcessInputQueueLocked(); // caller holds m_drainMutex
     void DrainQueuePreView();       // parse/store only (no wrap metrics yet);
@@ -272,7 +279,7 @@ private:
     // m_viewAttached lets the attached hot path skip the lock entirely.
     std::mutex              m_drainMutex;
     std::atomic<bool>       m_viewAttached{ false };
-    bool                    m_wrapExtended = true; // classic mod-16 fold of \x03 16-98;
+    bool                    m_wrapExtended = false; // classic mod-16 fold of \x03 16-98;
                                                    // guarded by m_drainMutex (parse-time read)
     bool                    m_needsRewrap = false; // lines stored before the
                                                    // first View existed have

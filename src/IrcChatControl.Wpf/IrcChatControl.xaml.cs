@@ -1,6 +1,9 @@
 using System;
+using System.Buffers;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Unicode;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -22,6 +25,17 @@ namespace IrcChatWpf
         private const double MinZoomFontSize = 6.0;
         private const double MaxZoomFontSize = 72.0;
 
+        // Mirrors IrcLineTextSize in the native RingBuffer.h — the renderer's
+        // per-line slot. Input longer than this is split across lines, never cut.
+        private const int MaxLineBytes = 512;
+
+        // Bounds on the style prefix re-applied to a continuation line:
+        // "\x04RRGGBB,RRGGBB" is the longest color code, and an SGR sequence is
+        // clipped to the second. Together with the five 1-byte toggles the
+        // prefix cannot exceed 43 bytes, so it can never starve the payload.
+        private const int MaxColorCodeBytes = 14;
+        private const int MaxSgrBytes = 24;
+
         private IrcSwapchainHost _ircHost;
         private bool _updatingScroll;
         private bool _selecting;
@@ -37,7 +51,7 @@ namespace IrcChatWpf
         // backstop.
         private readonly SafeRendererHandle _renderer;
         private bool _disposed;
-        private bool _wrapExtendedColors = true; // mirrors the native default
+        private bool _wrapExtendedColors = false; // mirrors the native default
 
         // LRU park registry (UI thread only — maintained from Loaded/Unloaded).
         // Parked controls keep their GPU surface warm for instant switch-back;
@@ -205,38 +219,385 @@ namespace IrcChatWpf
                 s_liveControls[i].TrimMemory();
         }
 
-        /// <summary>Appends one line to the scrollback. Thread-safe and cheap:
-        /// any thread may call this at thousands of lines per second. mIRC
-        /// control codes and ANSI SGR sequences are parsed inline; lines are
-        /// capped at 512 UTF-8 bytes. The scrollback lives on the persistent
-        /// native renderer, so lines added while the control is unloaded are
-        /// ingested immediately and appear when it reloads — nothing is
-        /// dropped or replayed.</summary>
+        /// <summary>Appends text to the scrollback. Thread-safe and cheap: any
+        /// thread may call this at thousands of lines per second. mIRC control
+        /// codes and ANSI SGR sequences are parsed inline.
+        /// <para>Input is never truncated. Embedded CR/LF start new lines, and
+        /// text longer than the renderer's 512-byte line slot is split across
+        /// continuation lines — broken at a word boundary where one is
+        /// available, with the active color and style re-applied to each piece.
+        /// One call can therefore add more than one line, so
+        /// <see cref="LineCount"/> may rise by more than one.</para>
+        /// <para>Note the slot is measured in raw UTF-8 bytes <i>including</i>
+        /// control codes, which the parser strips only after ingest: every
+        /// <c>\x04RRGGBB</c> spends 7 bytes of the line budget.</para>
+        /// The scrollback lives on the persistent native renderer, so lines
+        /// added while the control is unloaded are ingested immediately and
+        /// appear when it reloads — nothing is dropped or replayed.</summary>
         public void AddLine(string text)
         {
             if (string.IsNullOrEmpty(text) || _renderer == null || _renderer.IsClosed)
                 return;
 
-            // Encode on the stack: this runs thousands of times per second from
-            // producer threads, and a heap byte[] per line just feeds the GC. The
-            // native side caps lines at 512 bytes, so anything past that is dropped.
-            Span<byte> buffer = stackalloc byte[512];
-            System.Text.Unicode.Utf8.FromUtf16(text.AsSpan(), buffer,
-                out _, out int bytesWritten);
-            if (bytesWritten > 0)
+            ReadOnlySpan<char> span = text.AsSpan();
+
+            // Fast path: an ordinary short single line. Encodes on the stack —
+            // this runs thousands of times per second from producer threads and
+            // a heap byte[] per line just feeds the GC. Only input that actually
+            // needs splitting pays for the slower path below.
+            if (span.IndexOfAny('\r', '\n') < 0)
             {
-                try
+                Span<byte> buffer = stackalloc byte[MaxLineBytes];
+                if (Utf8.FromUtf16(span, buffer, out _, out int written) == OperationStatus.Done)
                 {
-                    NativeMethods.AddLine(_renderer, ref MemoryMarshal.GetReference(buffer), bytesWritten);
-                }
-                catch (ObjectDisposedException)
-                {
-                    // A producer racing Dispose (window closed mid-flood):
-                    // the line is for a dead window — drop it.
+                    if (written > 0 && Push(buffer.Slice(0, written)))
+                        _ircHost?.NotifyLinesPending(); // wake the attached view's timer, if any
                     return;
                 }
-                _ircHost?.NotifyLinesPending(); // wake the attached view's timer, if any
+                // DestinationTooSmall — fall through and split it.
             }
+
+            AddLineSplit(span);
+        }
+
+        // Hands one encoded line to the native queue. False means the renderer
+        // was disposed underneath us (window closed mid-flood), so the line is
+        // for a dead window and the caller should stop.
+        private bool Push(Span<byte> utf8)
+        {
+            try
+            {
+                NativeMethods.AddLine(_renderer, ref MemoryMarshal.GetReference(utf8), utf8.Length);
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // Slow path: CR/LF become separate lines and any segment too long for
+        // one slot is chunked. Wakes the view once at the end, not per chunk.
+        private void AddLineSplit(ReadOnlySpan<char> text)
+        {
+            bool pushed = false;
+            int start = 0;
+
+            for (int i = 0; i <= text.Length; i++)
+            {
+                if (i < text.Length && text[i] != '\r' && text[i] != '\n')
+                    continue;
+
+                if (i > start)
+                {
+                    if (!PushSegment(text.Slice(start, i - start)))
+                        return; // renderer gone
+                    pushed = true;
+                }
+
+                if (i == text.Length)
+                    break;
+
+                if (text[i] == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+                    i++; // CRLF is one break, not two
+                start = i + 1;
+            }
+
+            if (pushed)
+                _ircHost?.NotifyLinesPending();
+        }
+
+        // Encodes one newline-free segment, then chunks it to the slot size.
+        private bool PushSegment(ReadOnlySpan<char> segment)
+        {
+            byte[] rented = ArrayPool<byte>.Shared.Rent(Encoding.UTF8.GetMaxByteCount(segment.Length));
+            try
+            {
+                // The rental is sized for the worst case, so this always completes.
+                Utf8.FromUtf16(segment, rented, out _, out int total);
+                if (total == 0)
+                    return true;
+                return PushChunks(rented.AsSpan(0, total));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        // Splits an encoded segment across slots, re-applying the active style
+        // to every continuation so colors survive the break. No text can be
+        // lost here: `pos` advances by at least one byte per iteration and the
+        // loop runs until the whole span is consumed.
+        private bool PushChunks(Span<byte> bytes)
+        {
+            if (bytes.Length <= MaxLineBytes)
+                return Push(bytes);
+
+            Span<byte> chunk = stackalloc byte[MaxLineBytes];
+            Span<byte> color = stackalloc byte[MaxColorCodeBytes];
+            Span<byte> sgr = stackalloc byte[MaxSgrBytes];
+            int colorLen = 0;
+            int sgrLen = 0;
+            byte toggles = 0;
+            bool first = true;
+            int pos = 0;
+
+            while (pos < bytes.Length)
+            {
+                int prefixLen = first
+                    ? 0
+                    : WriteStylePrefix(chunk, toggles, color.Slice(0, colorLen), sgr.Slice(0, sgrLen));
+                int budget = MaxLineBytes - prefixLen;
+
+                ReadOnlySpan<byte> rest = bytes.Slice(pos);
+                int take = rest.Length <= budget ? rest.Length : FindSplit(rest, budget);
+
+                rest.Slice(0, take).CopyTo(chunk.Slice(prefixLen));
+                if (!Push(chunk.Slice(0, prefixLen + take)))
+                    return false;
+
+                AdvanceStyle(rest.Slice(0, take), ref toggles, color, ref colorLen, sgr, ref sgrLen);
+
+                pos += take;
+                if (pos < bytes.Length && bytes[pos] == (byte)' ')
+                    pos++; // swallow the space we broke on
+                first = false;
+            }
+
+            return true;
+        }
+
+        // Largest prefix of `s` fitting in `budget` bytes without cutting a
+        // UTF-8 scalar or a control sequence, preferring the last space in the
+        // final quarter — unlike the renderer's own width-adaptive word wrap,
+        // this break is baked in at ingest. Always returns at least 1 so the
+        // caller keeps making progress.
+        private static int FindSplit(ReadOnlySpan<byte> s, int budget)
+        {
+            int safe = 0;  // last boundary that is not inside a sequence
+            int space = 0; // last boundary just past a space
+            int i = 0;
+
+            while (i < budget)
+            {
+                int seq = SequenceLength(s, i);
+                if (seq > 0)
+                {
+                    if (i + seq > budget)
+                        break; // the sequence itself would be cut
+                    i += seq;
+                    safe = i;
+                    continue;
+                }
+
+                int ch = Utf8SequenceLength(s[i]);
+                if (i + ch > budget)
+                    break; // the scalar would be cut
+                bool wasSpace = s[i] == (byte)' ';
+                i += ch;
+                safe = i;
+                if (wasSpace)
+                    space = i;
+            }
+
+            if (space > 0 && space >= budget - budget / 4)
+                return space;
+            if (safe > 0)
+                return safe;
+
+            // One sequence or scalar longer than the entire budget. Cut at the
+            // largest scalar boundary that fits so the loop still advances.
+            int hard = budget;
+            while (hard > 1 && (s[hard] & 0xC0) == 0x80)
+                hard--;
+            return hard;
+        }
+
+        // Replays the style effects of an emitted chunk so the next
+        // continuation can re-apply them.
+        private static void AdvanceStyle(ReadOnlySpan<byte> s, ref byte toggles,
+            Span<byte> color, ref int colorLen, Span<byte> sgr, ref int sgrLen)
+        {
+            int i = 0;
+            while (i < s.Length)
+            {
+                int seq = SequenceLength(s, i);
+                if (seq == 0)
+                {
+                    i += Utf8SequenceLength(s[i]);
+                    continue;
+                }
+
+                switch (s[i])
+                {
+                    case 0x02: toggles ^= 0x01; break; // bold
+                    case 0x1D: toggles ^= 0x02; break; // italic
+                    case 0x1F: toggles ^= 0x04; break; // underline
+                    case 0x1E: toggles ^= 0x08; break; // strikethrough
+                    case 0x16: toggles ^= 0x10; break; // reverse
+                    case 0x0F:                          // reset everything
+                        toggles = 0;
+                        colorLen = 0;
+                        sgrLen = 0;
+                        break;
+                    case 0x03:
+                    case 0x04:
+                        // Carried verbatim: re-emitting the original bytes
+                        // reproduces the exact color, bare-reset forms included.
+                        colorLen = seq <= color.Length ? seq : 0;
+                        if (colorLen > 0)
+                            s.Slice(i, colorLen).CopyTo(color);
+                        break;
+                    case 0x1B:
+                        // Only SGR changes style; other CSI sequences are inert.
+                        if (seq <= sgr.Length && s[i + seq - 1] == (byte)'m')
+                        {
+                            sgrLen = seq;
+                            s.Slice(i, seq).CopyTo(sgr);
+                        }
+                        break;
+                }
+                i += seq;
+            }
+        }
+
+        // Writes the carried style to the front of `dest` and returns its
+        // length. Toggles lead so a following color code is not undone by them.
+        private static int WriteStylePrefix(Span<byte> dest, byte toggles,
+            ReadOnlySpan<byte> color, ReadOnlySpan<byte> sgr)
+        {
+            int n = 0;
+            if ((toggles & 0x01) != 0) dest[n++] = 0x02;
+            if ((toggles & 0x02) != 0) dest[n++] = 0x1D;
+            if ((toggles & 0x04) != 0) dest[n++] = 0x1F;
+            if ((toggles & 0x08) != 0) dest[n++] = 0x1E;
+            if ((toggles & 0x10) != 0) dest[n++] = 0x16;
+            if (color.Length > 0) { color.CopyTo(dest.Slice(n)); n += color.Length; }
+            if (sgr.Length > 0) { sgr.CopyTo(dest.Slice(n)); n += sgr.Length; }
+            return n;
+        }
+
+        // Byte length of the control sequence starting at s[i], or 0 when s[i]
+        // begins ordinary text. Mirrors IrcParser::Parse in the native renderer
+        // (src/IrcRendererNative/IrcParser.cpp). Only chunk cosmetics depend on
+        // this agreeing exactly — no text is lost if it does not, because
+        // chunking advances through every byte regardless.
+        private static int SequenceLength(ReadOnlySpan<byte> s, int i)
+        {
+            switch (s[i])
+            {
+                case 0x01: // CTCP delimiter (stripped by the parser)
+                case 0x02: // bold
+                case 0x0F: // reset
+                case 0x11: // monospace toggle (stripped)
+                case 0x16: // reverse
+                case 0x1D: // italic
+                case 0x1E: // strikethrough
+                case 0x1F: // underline
+                    return 1;
+                case 0x03:
+                    return 1 + MircColorLength(s, i + 1);
+                case 0x04:
+                    return 1 + HexColorLength(s, i + 1);
+                case 0x1B:
+                    return EscapeLength(s, i);
+                default:
+                    return 0;
+            }
+        }
+
+        // \x03 payload: up to two foreground digits, then ",NN" only when a
+        // digit follows the comma (otherwise the comma is literal text).
+        private static int MircColorLength(ReadOnlySpan<byte> s, int p)
+        {
+            int start = p;
+            p = SkipDigits(s, p, 2);
+            if (p + 1 < s.Length && s[p] == (byte)',' && IsDigit(s[p + 1]))
+                p = SkipDigits(s, p + 1, 2);
+            return p - start;
+        }
+
+        // \x04 payload: exactly six hex digits or nothing is consumed; the
+        // background half likewise needs its own valid six.
+        private static int HexColorLength(ReadOnlySpan<byte> s, int p)
+        {
+            int start = p;
+            if (!IsHex6(s, p))
+                return 0;
+            p += 6;
+            if (p < s.Length && s[p] == (byte)',' && IsHex6(s, p + 1))
+                p += 7;
+            return p - start;
+        }
+
+        // ESC sequences: OSC runs to BEL, CSI to its final byte, and the
+        // remaining forms are two bytes (three for charset selects).
+        private static int EscapeLength(ReadOnlySpan<byte> s, int i)
+        {
+            int p = i + 1;
+            if (p >= s.Length)
+                return 1; // bare ESC at end of line
+
+            byte c = s[p];
+            if (c == (byte)']')
+            {
+                while (p < s.Length && s[p] != 0x07) p++;
+                if (p < s.Length) p++;
+                return p - i;
+            }
+            if (c != (byte)'[')
+            {
+                p++;
+                if ((c == (byte)'(' || c == (byte)')' || c == (byte)'#') && p < s.Length) p++;
+                return p - i;
+            }
+
+            p++; // past '['
+            while (p < s.Length)
+            {
+                byte b = s[p];
+                if (b >= 0x20 && b <= 0x3F) { p++; continue; } // parameter/intermediate
+                if (b >= 0x40 && b <= 0x7E) { p++; break; }    // final byte
+                break;                                          // control/high byte: abandoned
+            }
+            return p - i;
+        }
+
+        private static int Utf8SequenceLength(byte b)
+        {
+            if (b < 0x80) return 1;
+            if ((b & 0xE0) == 0xC0) return 2;
+            if ((b & 0xF0) == 0xE0) return 3;
+            if ((b & 0xF8) == 0xF0) return 4;
+            return 1; // stray continuation or invalid lead: its own unit
+        }
+
+        private static bool IsDigit(byte b)
+        {
+            return b >= (byte)'0' && b <= (byte)'9';
+        }
+
+        private static int SkipDigits(ReadOnlySpan<byte> s, int p, int max)
+        {
+            int n = 0;
+            while (p < s.Length && n < max && IsDigit(s[p])) { p++; n++; }
+            return p;
+        }
+
+        private static bool IsHex6(ReadOnlySpan<byte> s, int p)
+        {
+            if (p < 0 || p + 6 > s.Length)
+                return false;
+            for (int k = 0; k < 6; k++)
+            {
+                byte b = s[p + k];
+                if (!((b >= (byte)'0' && b <= (byte)'9')
+                   || (b >= (byte)'a' && b <= (byte)'f')
+                   || (b >= (byte)'A' && b <= (byte)'F')))
+                    return false;
+            }
+            return true;
         }
 
         // False in the XAML designer and after Dispose. UI-thread members
@@ -324,11 +685,11 @@ namespace IrcChatWpf
         /// [6, 72] DIPs; plain wheel scrolling is unaffected.</summary>
         public bool EnableFontZoom { get; set; } = true;
 
-        /// <summary>Classic-client color compatibility (default true): inbound
-        /// mIRC \x03 color indices 16–98 fold onto the basic 16-color palette
-        /// (index mod 16), the way pre-extended-palette clients rendered
-        /// rainbow spam and art. Set false to use the standardized extended
-        /// palette (modern mIRC behavior). Applies to newly added lines.</summary>
+        /// <summary>Classic-client color compatibility (default false): inbound
+        /// mIRC \x03 color indices 16–98 render using the standardized extended
+        /// palette (modern mIRC behavior). Set true to fold them onto the basic
+        /// 16-color palette (index mod 16) instead, the way pre-extended-palette
+        /// clients rendered rainbow spam and art. Applies to newly added lines.</summary>
         public bool WrapExtendedColors
         {
             get => _wrapExtendedColors;
